@@ -1,0 +1,43 @@
+name: جمع بيانات NASDAQ اليومية
+
+on:
+  schedule:
+    # الجدولة هنا بمعيار UTC (عالمي)
+    # 2:00 صباحاً UTC يعني بعد إغلاق السوق بحوالي 6 ساعات لضمان استقرار البيانات
+    - cron: '0 2 * * 1-5'   # 2:00 صباحاً UTC، من الاثنين للجمعة فقط
+  workflow_dispatch:          # يسمح بالتشغيل اليدوي أيضاً عند الحاجة للاختبار
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: تحميل المستودع
+        uses: actions/checkout@v4
+
+      - name: إعداد بايثون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: تثبيت المكتبات المطلوبة
+        run: pip install requests
+
+      - name: جلب قائمة رموز NASDAQ الحالية (يتضمن أي شركة جديدة/محذوفة تلقائياً)
+        run: python scripts/fetch-nasdaq-symbols.py
+
+      - name: جلب بيانات OHLC الكاملة من Finnhub لكل الرموز
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python scripts/fetch-finnhub-ohlc.py
+
+      - name: دمج البيانات وتحديث الأرشيف وتنظيف الملفات القديمة
+        run: python scripts/merge-and-cleanup.py
+
+      - name: حفظ التحديثات بالمستودع
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add daily-data/ latest.json symbols-reference.json
+          git commit -m "تحديث بيانات $(date +'%Y-%m-%d')" || echo "لا توجد تغييرات جديدة لحفظها"
+          git push
