@@ -31,7 +31,11 @@ jobs:
         run: |
           python backtest/engine.py
 
-      - name: حفظ جميع النتائج كـ Artifact
+      - name: حذف ملف البحث الضخم قبل الحفظ
+        run: |
+          rm -f results/research_dataset.csv
+
+      - name: حفظ النتائج كـ Artifact
         uses: actions/upload-artifact@v4
         with:
           name: nasdaq-backtest-results
@@ -44,6 +48,7 @@ jobs:
 
           git add results/indicator_test.csv
           git add results/baseline_test.csv
+          git add results/strategy_tests.csv
           git add results/summary.json
 
           git diff --cached --quiet || git commit -m "Update Nasdaq backtest results"
