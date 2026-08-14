@@ -1,6 +1,6 @@
 {
-  "engine": "Nasdaq Backtest Engine V3",
-  "generated_utc": "2026-08-14T15:44:54.873567+00:00",
+  "engine": "Nasdaq Backtest Engine V4 Research",
+  "generated_utc": "2026-08-14T16:11:28.832454+00:00",
   "source_directory": "daily-data/",
   "source_files_read": 155,
   "failed_files": 0,
@@ -29,6 +29,8 @@
     "20D Resistance",
     "50D Support",
     "50D Resistance",
+    "100D Support",
+    "100D Resistance",
     "20D Breakout",
     "20D Breakdown",
     "5D Momentum",
@@ -40,7 +42,12 @@
     "Pivot R1/R2",
     "Pivot S1/S2",
     "Hammer",
-    "Bullish Engulfing"
+    "Bullish Engulfing",
+    "Higher Low",
+    "Bottom Reclaim",
+    "Support Rejection",
+    "Breakout Retest",
+    "Resistance Rejection"
   ],
   "source_files_modified": false,
   "warning": "Research statistics only. No investment recommendation."
