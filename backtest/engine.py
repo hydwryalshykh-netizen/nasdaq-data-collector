@@ -266,6 +266,28 @@ def add_features(group):
         min_periods=50
     ).min()
 
+    g["resistance100"] = high.shift(1).rolling(
+        100,
+        min_periods=100
+    ).max()
+
+    g["support100"] = low.shift(1).rolling(
+        100,
+        min_periods=100
+    ).min()
+
+    g["distance_support100"] = (
+        close / g["support100"] - 1
+    )
+
+    g["distance_resistance50"] = (
+        close / g["resistance50"] - 1
+    )
+
+    g["distance_resistance100"] = (
+        close / g["resistance100"] - 1
+    )
+
     g["distance_support20"] = (
         close / g["support20"] - 1
     )
@@ -434,6 +456,64 @@ def add_features(group):
     )
 
     # -----------------------------
+    # Price-structure / bottom signals
+    # -----------------------------
+    # All rolling extrema use only prior bars for the signal decision.
+    prior10_low = low.shift(1).rolling(10, min_periods=10).min()
+    prior10_high = high.shift(1).rolling(10, min_periods=10).max()
+    prior20_low = low.shift(1).rolling(20, min_periods=20).min()
+    prior20_high = high.shift(1).rolling(20, min_periods=20).max()
+
+    g["near_support100"] = (
+        (g["distance_support100"] >= 0)
+        & (g["distance_support100"] <= 0.05)
+    )
+
+    g["near_resistance50"] = (
+        (g["distance_resistance50"] <= 0)
+        & (g["distance_resistance50"] >= -0.03)
+    )
+
+    g["near_resistance100"] = (
+        (g["distance_resistance100"] <= 0)
+        & (g["distance_resistance100"] >= -0.03)
+    )
+
+    # Higher-low structure: today's low is above the prior 10-day low
+    # while price has recently recovered from a local low.
+    g["higher_low"] = (
+        (low > prior10_low)
+        & (close > close.shift(1))
+        & (close > g["support20"])
+    )
+
+    # Recovery from a recent 20D low without using today's low to define it.
+    g["bottom_reclaim"] = (
+        (close > prior20_low)
+        & (close.shift(1) <= prior20_low.shift(1))
+    )
+
+    # Rejection of support: intraday low reaches support area but closes back above it.
+    g["support_rejection"] = (
+        (low <= g["support20"] * 1.01)
+        & (close > g["support20"])
+        & (close > open_)
+    )
+
+    # Breakout confirmation / retest style conditions.
+    g["breakout_retest"] = (
+        (close > g["resistance20"])
+        & (low <= g["resistance20"] * 1.02)
+        & (close > open_)
+    )
+
+    g["resistance_rejection"] = (
+        (high >= g["resistance20"] * 0.99)
+        & (close < g["resistance20"])
+        & (close < open_)
+    )
+
+    # -----------------------------
     # Individual research signals
     # -----------------------------
     g["rsi_oversold"] = g["rsi14"] < 30
@@ -573,17 +653,12 @@ def build_features(df):
 
 
 def summarize(mask, df, label):
-    selected = df.loc[
-        mask.fillna(False)
-    ].copy()
-
+    selected = df.loc[mask.fillna(False)].copy()
     rows = []
 
     for horizon in HORIZONS:
         returns = pd.to_numeric(
-            selected[
-                f"forward_return_{horizon}"
-            ],
+            selected[f"forward_return_{horizon}"],
             errors="coerce"
         ).dropna()
 
@@ -592,57 +667,67 @@ def summarize(mask, df, label):
 
         positive = returns[returns > 0]
         negative = returns[returns < 0]
-
         gross_profit = positive.sum()
         gross_loss = -negative.sum()
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
 
-        if gross_loss > 0:
-            profit_factor = (
-                gross_profit
-                / gross_loss
+        # Robustness diagnostics: determine whether the mean is dominated by
+        # a tiny number of extreme winners. This is a research diagnostic,
+        # not a trading performance guarantee.
+        trim_n = max(1, int(len(returns) * 0.01)) if len(returns) >= 20 else 0
+        if trim_n:
+            without_top = returns.sort_values().iloc[:-trim_n]
+            avg_ex_top1 = without_top.mean()
+            top1_contribution = (
+                positive.nlargest(trim_n).sum() / positive.sum()
+                if positive.sum() > 0 else np.nan
             )
         else:
-            profit_factor = np.nan
+            avg_ex_top1 = returns.mean()
+            top1_contribution = np.nan
+
+        std_return = returns.std(ddof=1) if len(returns) > 1 else np.nan
+        median = returns.median()
+
+        # Conservative research score: rewards positive median/mean,
+        # profit factor > 1 and win rate > 50%, while penalizing outlier
+        # dependence and very small samples. It is only for ranking candidates.
+        win_rate = (returns > 0).mean()
+        sample_factor = min(1.0, len(returns) / 1000.0)
+        pf_factor = min(1.5, max(0.0, profit_factor if np.isfinite(profit_factor) else 0.0)) / 1.5
+        edge_factor = min(1.0, max(0.0, (win_rate - 0.45) / 0.15))
+        median_factor = min(1.0, max(0.0, median / 0.02))
+        robust_mean_factor = min(1.0, max(0.0, avg_ex_top1 / 0.02))
+        outlier_penalty = (
+            min(1.0, max(0.0, top1_contribution - 0.50) / 0.50)
+            if np.isfinite(top1_contribution) else 0.0
+        )
+        robustness_score = 100 * sample_factor * (
+            0.30 * pf_factor
+            + 0.25 * edge_factor
+            + 0.20 * median_factor
+            + 0.25 * robust_mean_factor
+        ) * (1 - 0.50 * outlier_penalty)
 
         rows.append({
             "rule": label,
             "horizon_days": horizon,
             "signals": int(len(returns)),
-            "win_rate": float(
-                (returns > 0).mean()
-            ),
-            "loss_rate": float(
-                (returns < 0).mean()
-            ),
-            "average_return": float(
-                returns.mean()
-            ),
-            "median_return": float(
-                returns.median()
-            ),
-            "p10_return": float(
-                returns.quantile(0.10)
-            ),
-            "p25_return": float(
-                returns.quantile(0.25)
-            ),
-            "p75_return": float(
-                returns.quantile(0.75)
-            ),
-            "p90_return": float(
-                returns.quantile(0.90)
-            ),
-            "best_return": float(
-                returns.max()
-            ),
-            "worst_return": float(
-                returns.min()
-            ),
-            "profit_factor": (
-                float(profit_factor)
-                if not math.isnan(profit_factor)
-                else None
-            ),
+            "win_rate": float(win_rate),
+            "loss_rate": float((returns < 0).mean()),
+            "average_return": float(returns.mean()),
+            "median_return": float(median),
+            "p10_return": float(returns.quantile(0.10)),
+            "p25_return": float(returns.quantile(0.25)),
+            "p75_return": float(returns.quantile(0.75)),
+            "p90_return": float(returns.quantile(0.90)),
+            "best_return": float(returns.max()),
+            "worst_return": float(returns.min()),
+            "std_return": float(std_return) if np.isfinite(std_return) else None,
+            "average_ex_top_1pct": float(avg_ex_top1),
+            "top_1pct_profit_contribution": float(top1_contribution) if np.isfinite(top1_contribution) else None,
+            "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
+            "robustness_score": float(robustness_score),
         })
 
     return rows
@@ -705,6 +790,30 @@ def main():
         "Near 50D Support":
             features["near_support50"],
 
+        "Near 100D Support":
+            features["near_support100"],
+
+        "Near 50D Resistance":
+            features["near_resistance50"],
+
+        "Near 100D Resistance":
+            features["near_resistance100"],
+
+        "Higher Low":
+            features["higher_low"],
+
+        "Bottom Reclaim":
+            features["bottom_reclaim"],
+
+        "Support Rejection":
+            features["support_rejection"],
+
+        "Breakout Retest":
+            features["breakout_retest"],
+
+        "Resistance Rejection":
+            features["resistance_rejection"],
+
         "Below Bollinger Lower":
             features["below_bb_lower"],
 
@@ -746,69 +855,63 @@ def main():
     # Candidate strategy combinations
     # --------------------------------
     combinations = {
+        # Trend candidates
         "Trend: EMA50 + Momentum":
-            features["above_ema50"]
-            & features["momentum_positive"],
-
-        "Trend: EMA50 + Volume":
-            features["above_ema50"]
-            & features["volume_1_5x"],
-
+            features["above_ema50"] & features["momentum_positive"],
+        "Trend: EMA50 + Momentum + Volume":
+            features["above_ema50"] & features["momentum_positive"] & features["volume_1_5x"],
         "Trend: EMA50 + ADX":
-            features["above_ema50"]
-            & features["adx_strong"],
+            features["above_ema50"] & features["adx_strong"],
 
-        "Trend: EMA50 + Volume + ADX":
-            features["above_ema50"]
-            & features["volume_1_5x"]
-            & features["adx_strong"],
+        # Bottom / support candidates
+        "Reversal: 50D Support + RSI":
+            features["near_support50"] & features["rsi_oversold"],
+        "Reversal: 50D Support + Higher Low":
+            features["near_support50"] & features["higher_low"],
+        "Reversal: 50D Support + Volume":
+            features["near_support50"] & features["volume_1_5x"],
+        "Reversal: 50D Support + RSI + Higher Low":
+            features["near_support50"] & features["rsi_oversold"] & features["higher_low"],
+        "Reversal: 50D Support + Hammer":
+            features["near_support50"] & features["hammer"],
+        "Reversal: 50D Support + Bull Engulf":
+            features["near_support50"] & features["bullish_engulfing"],
+        "Reversal: Support Rejection + RSI":
+            features["support_rejection"] & features["rsi_oversold"],
+        "Reversal: Support Rejection + Volume":
+            features["support_rejection"] & features["volume_1_5x"],
+        "Reversal: 100D Support + RSI":
+            features["near_support100"] & features["rsi_oversold"],
+        "Reversal: Bottom Reclaim + Support":
+            features["bottom_reclaim"] & features["near_support50"],
 
-        "Reversal: Breakdown + RSI":
-            features["breakdown20"]
-            & features["rsi_oversold"],
-
-        "Reversal: Breakdown + Volume":
-            features["breakdown20"]
-            & features["volume_1_5x"],
-
-        "Reversal: Breakdown + 50D Support":
-            features["breakdown20"]
-            & features["near_support50"],
-
-        "Reversal: Breakdown + RSI + Volume":
-            features["breakdown20"]
-            & features["rsi_oversold"]
-            & features["volume_1_5x"],
-
-        "Reversal: RSI + Support":
-            features["rsi_oversold"]
-            & features["near_support"],
-
+        # Existing useful reversal candidates retained for comparison
+        "Reversal: RSI + 20D Support":
+            features["rsi_oversold"] & features["near_support"],
         "Reversal: RSI + Stoch + Support":
-            features["rsi_oversold"]
-            & features["stoch_oversold"]
-            & features["near_support"],
-
-        "Reversal: BB Reclaim + RSI":
-            features["bb_reclaim"]
-            & features["rsi_oversold"],
-
+            features["rsi_oversold"] & features["stoch_oversold"] & features["near_support"],
         "Reversal: Hammer + Support":
-            features["hammer"]
-            & features["near_support"],
-
+            features["hammer"] & features["near_support"],
         "Reversal: Bull Engulf + Support":
-            features["bullish_engulfing"]
-            & features["near_support"],
+            features["bullish_engulfing"] & features["near_support"],
 
+        # Secondary breakdown trigger — not treated as the primary strategy
+        "Secondary: Breakdown + RSI":
+            features["breakdown20"] & features["rsi_oversold"],
+        "Secondary: Breakdown + RSI + Volume":
+            features["breakdown20"] & features["rsi_oversold"] & features["volume_1_5x"],
+        "Secondary: Breakdown + 50D Support":
+            features["breakdown20"] & features["near_support50"],
+
+        # Breakout / resistance candidates
         "Breakout: Breakout + Volume":
-            features["breakout20"]
-            & features["volume_1_5x"],
-
+            features["breakout20"] & features["volume_1_5x"],
         "Breakout: Breakout + EMA50 + Volume":
-            features["breakout20"]
-            & features["above_ema50"]
-            & features["volume_1_5x"],
+            features["breakout20"] & features["above_ema50"] & features["volume_1_5x"],
+        "Breakout: Retest + Volume":
+            features["breakout_retest"] & features["volume_1_5x"],
+        "Resistance: Rejection + RSI":
+            features["resistance_rejection"] & features["rsi_overbought"],
     }
 
     combination_rows = []
@@ -854,7 +957,7 @@ def main():
     # --------------------------------
     summary = {
         "engine":
-            "Nasdaq Backtest Engine V3",
+            "Nasdaq Backtest Engine V4 Research",
 
         "generated_utc":
             pd.Timestamp.now(
@@ -905,6 +1008,8 @@ def main():
             "20D Resistance",
             "50D Support",
             "50D Resistance",
+            "100D Support",
+            "100D Resistance",
             "20D Breakout",
             "20D Breakdown",
             "5D Momentum",
@@ -916,7 +1021,12 @@ def main():
             "Pivot R1/R2",
             "Pivot S1/S2",
             "Hammer",
-            "Bullish Engulfing"
+            "Bullish Engulfing",
+            "Higher Low",
+            "Bottom Reclaim",
+            "Support Rejection",
+            "Breakout Retest",
+            "Resistance Rejection"
         ],
 
         "source_files_modified":
@@ -942,7 +1052,7 @@ def main():
         )
 
     print(
-        "Nasdaq Backtest Engine V3 completed."
+        "Nasdaq Backtest Engine V4 Research completed."
     )
 
     print(
