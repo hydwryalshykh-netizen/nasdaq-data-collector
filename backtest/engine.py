@@ -1,203 +1,79 @@
 import json
 import math
-import re
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-
-# ============================================================
-# Nasdaq Backtest Engine V2
-# IMPORTANT:
-# This engine ONLY READS daily-data/.
-# It does not modify or delete any source data.
-# ============================================================
-
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "daily-data"
 RESULTS_DIR = ROOT / "results"
-CONFIG_FILE = ROOT / "backtest" / "config.json"
+RESULTS_DIR.mkdir(exist_ok=True)
+
+HORIZONS = [1, 3, 5, 10, 20]
+MIN_HISTORY = 60
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-DEFAULT_HORIZONS = [1, 3, 5, 10, 20]
-
-
-# ============================================================
-# LOAD DAILY FILES
-# ============================================================
-
-def load_daily_data():
-    if not DATA_DIR.exists():
-        raise FileNotFoundError(
-            f"daily-data directory was not found: {DATA_DIR}"
-        )
-
+def load_data():
+    rows = []
     files = sorted(DATA_DIR.glob("*.json"))
+    failed = []
 
-    if not files:
-        raise FileNotFoundError(
-            "No JSON files found inside daily-data/"
-        )
-
-    all_rows = []
-    file_count = 0
-    failed_files = []
-
-    for file_path in files:
-
+    for path in files:
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with path.open("r", encoding="utf-8") as f:
+                obj = json.load(f)
 
-            file_count += 1
+            records = obj.get("records", [])
+            if not isinstance(records, list):
+                raise ValueError("records is not a list")
 
-        except Exception as e:
-            failed_files.append({
-                "file": file_path.name,
-                "error": str(e)
-            })
-            continue
+            rows.extend(records)
 
-        # ----------------------------------------------------
-        # Your exact structure:
-        #
-        # {
-        #   "date": "2026-01-02",
-        #   "records": [...]
-        # }
-        # ----------------------------------------------------
+        except Exception as exc:
+            failed.append({"file": path.name, "error": str(exc)})
 
-        file_date = data.get("date")
+    if not rows:
+        raise RuntimeError("No usable records found in daily-data/")
 
-        records = data.get("records", [])
+    df = pd.DataFrame(rows)
 
-        if not isinstance(records, list):
-            continue
+    required = ["symbol", "date", "open", "high", "low", "close", "volume"]
+    for col in required:
+        if col not in df.columns:
+            raise RuntimeError(f"Missing required column: {col}")
 
-        for record in records:
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-            if not isinstance(record, dict):
-                continue
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            symbol = record.get("symbol")
+    df = df.dropna(subset=required).copy()
 
-            if not symbol:
-                continue
-
-            row = {
-                "date": record.get("date") or file_date,
-                "symbol": str(symbol).upper().strip(),
-
-                "open": record.get("open"),
-                "high": record.get("high"),
-                "low": record.get("low"),
-                "close": record.get("close"),
-                "volume": record.get("volume"),
-
-                "market_cap": record.get("market_cap"),
-                "sector": record.get("sector"),
-                "industry": record.get("industry"),
-                "name": record.get("name"),
-            }
-
-            all_rows.append(row)
-
-    if not all_rows:
-        raise RuntimeError(
-            "No usable records were found in daily-data/"
-        )
-
-    df = pd.DataFrame(all_rows)
-
-    return df, file_count, failed_files
-
-
-# ============================================================
-# CLEAN DATA
-# ============================================================
-
-def clean_data(df):
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "market_cap"
-    ]
-
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df["date"] = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
-
-    df["symbol"] = (
-        df["symbol"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    # Remove invalid records
-    df = df.dropna(
-        subset=[
-            "date",
-            "symbol",
-            "close"
-        ]
-    )
-
-    df = df[df["close"] > 0]
-
-    # Fill missing OHLC conservatively
-    df["open"] = df["open"].fillna(df["close"])
-    df["high"] = df["high"].fillna(df["close"])
-    df["low"] = df["low"].fillna(df["close"])
-
-    df["volume"] = df["volume"].fillna(0)
-
-    # Remove impossible OHLC records
     df = df[
-        (df["high"] >= df["low"]) &
-        (df["high"] >= df["close"]) &
-        (df["high"] >= df["open"]) &
-        (df["low"] <= df["close"]) &
-        (df["low"] <= df["open"])
+        (df["open"] > 0)
+        & (df["high"] > 0)
+        & (df["low"] > 0)
+        & (df["close"] > 0)
     ]
 
-    # One record per symbol/day
-    df = (
-        df.sort_values(
-            ["symbol", "date"]
-        )
-        .drop_duplicates(
-            ["symbol", "date"],
-            keep="last"
-        )
+    # Basic OHLC validation.
+    df = df[df["high"] >= df[["open", "close", "low"]].max(axis=1)]
+    df = df[df["low"] <= df[["open", "close", "high"]].min(axis=1)]
+
+    df = df.drop_duplicates(
+        subset=["symbol", "date"],
+        keep="last"
     )
 
-    return df.reset_index(drop=True)
+    df = df.sort_values(
+        ["symbol", "date"]
+    ).reset_index(drop=True)
+
+    return df, files, failed
 
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
-
-def calculate_rsi(series, period=14):
-
+def rsi(series, period=14):
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -217,733 +93,782 @@ def calculate_rsi(series, period=14):
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    rsi = 100 - (
-        100 / (1 + rs)
+    result = 100 - (100 / (1 + rs))
+
+    result = result.where(avg_loss != 0, 100)
+    result = result.where(
+        ~((avg_gain == 0) & (avg_loss == 0)),
+        50
     )
 
-    return rsi
+    return result
 
 
-def calculate_atr(group, period=14):
-
-    previous_close = group["close"].shift(1)
-
-    tr1 = group["high"] - group["low"]
-
-    tr2 = (
-        group["high"] - previous_close
-    ).abs()
-
-    tr3 = (
-        group["low"] - previous_close
-    ).abs()
+def atr(high, low, close, period=14):
+    previous_close = close.shift(1)
 
     true_range = pd.concat(
-        [tr1, tr2, tr3],
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
         axis=1
     ).max(axis=1)
 
-    atr = true_range.ewm(
+    return true_range.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period
     ).mean()
 
-    return atr
 
+def adx(high, low, close, period=14):
+    up_move = high.diff()
+    down_move = -low.diff()
 
-def add_indicators(df):
-
-    df = df.sort_values(
-        ["symbol", "date"]
-    ).copy()
-
-    groups = df.groupby(
-        "symbol",
-        group_keys=False
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0),
+        0.0
     )
 
-    # ------------------------------
-    # RSI
-    # ------------------------------
-
-    df["rsi14"] = groups["close"].transform(
-        lambda x: calculate_rsi(x, 14)
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0),
+        0.0
     )
 
-    # ------------------------------
-    # EMA
-    # ------------------------------
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ],
+        axis=1
+    ).max(axis=1)
 
-    df["ema20"] = groups["close"].transform(
-        lambda x: x.ewm(
-            span=20,
-            adjust=False,
-            min_periods=20
-        ).mean()
+    tr_avg = true_range.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    plus_avg = plus_dm.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    minus_avg = minus_dm.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    plus_di = 100 * plus_avg / tr_avg.replace(0, np.nan)
+    minus_di = 100 * minus_avg / tr_avg.replace(0, np.nan)
+
+    dx = (
+        100
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(0, np.nan)
     )
 
-    df["ema50"] = groups["close"].transform(
-        lambda x: x.ewm(
-            span=50,
-            adjust=False,
-            min_periods=50
-        ).mean()
+    return dx.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+
+def add_features(group):
+    g = group.sort_values("date").copy()
+
+    close = g["close"]
+    high = g["high"]
+    low = g["low"]
+    open_ = g["open"]
+    volume = g["volume"]
+
+    # -----------------------------
+    # Trend
+    # -----------------------------
+    g["ema20"] = close.ewm(
+        span=20,
+        adjust=False,
+        min_periods=20
+    ).mean()
+
+    g["ema50"] = close.ewm(
+        span=50,
+        adjust=False,
+        min_periods=50
+    ).mean()
+
+    g["sma20"] = close.rolling(
+        20,
+        min_periods=20
+    ).mean()
+
+    # -----------------------------
+    # Momentum / volatility
+    # -----------------------------
+    g["rsi14"] = rsi(close, 14)
+
+    g["atr14"] = atr(
+        high,
+        low,
+        close,
+        14
     )
 
-    df["ema200"] = groups["close"].transform(
-        lambda x: x.ewm(
-            span=200,
-            adjust=False,
-            min_periods=200
-        ).mean()
-    )
+    g["atr_pct"] = g["atr14"] / close
 
-    # ------------------------------
-    # SMA
-    # ------------------------------
+    g["momentum5"] = close / close.shift(5) - 1
+    g["momentum20"] = close / close.shift(20) - 1
 
-    df["sma20"] = groups["close"].transform(
-        lambda x: x.rolling(20).mean()
-    )
-
-    df["sma50"] = groups["close"].transform(
-        lambda x: x.rolling(50).mean()
-    )
-
-    # ------------------------------
-    # Returns / Momentum
-    # ------------------------------
-
-    df["return_1d"] = groups["close"].pct_change(1)
-
-    df["return_5d"] = groups["close"].pct_change(5)
-
-    df["return_20d"] = groups["close"].pct_change(20)
-
-    # ------------------------------
+    # -----------------------------
     # Volume
-    # ------------------------------
+    # -----------------------------
+    g["volume_avg20"] = volume.rolling(
+        20,
+        min_periods=20
+    ).mean()
 
-    df["volume_avg20"] = groups["volume"].transform(
-        lambda x: x.rolling(20).mean()
+    g["volume_ratio20"] = (
+        volume
+        / g["volume_avg20"].replace(0, np.nan)
     )
 
-    df["volume_ratio"] = (
-        df["volume"] /
-        df["volume_avg20"].replace(0, np.nan)
-    )
-
-    # ------------------------------
-    # ATR
-    # ------------------------------
-
-    df["atr14"] = groups.apply(
-        lambda x: calculate_atr(x, 14),
-        include_groups=False
-    ).reset_index(
-        level=0,
-        drop=True
-    )
-
-    # ------------------------------
-    # 20-day breakout
+    # -----------------------------
+    # Support / resistance
     #
     # IMPORTANT:
-    # We use SHIFT(1).
+    # shift(1) means today's signal
+    # cannot use today's high/low.
+    # -----------------------------
+    g["resistance20"] = high.shift(1).rolling(
+        20,
+        min_periods=20
+    ).max()
+
+    g["support20"] = low.shift(1).rolling(
+        20,
+        min_periods=20
+    ).min()
+
+    g["resistance50"] = high.shift(1).rolling(
+        50,
+        min_periods=50
+    ).max()
+
+    g["support50"] = low.shift(1).rolling(
+        50,
+        min_periods=50
+    ).min()
+
+    g["distance_support20"] = (
+        close / g["support20"] - 1
+    )
+
+    g["distance_resistance20"] = (
+        close / g["resistance20"] - 1
+    )
+
+    g["distance_support50"] = (
+        close / g["support50"] - 1
+    )
+
+    # -----------------------------
+    # Breakout / breakdown
+    # -----------------------------
+    g["breakout20"] = (
+        close > g["resistance20"]
+    )
+
+    g["breakdown20"] = (
+        close < g["support20"]
+    )
+
+    # -----------------------------
+    # Bollinger Bands
+    # -----------------------------
+    bb_mid = close.rolling(
+        20,
+        min_periods=20
+    ).mean()
+
+    bb_std = close.rolling(
+        20,
+        min_periods=20
+    ).std(ddof=0)
+
+    g["bb_mid"] = bb_mid
+    g["bb_upper"] = bb_mid + 2 * bb_std
+    g["bb_lower"] = bb_mid - 2 * bb_std
+
+    bb_width = (
+        g["bb_upper"] - g["bb_lower"]
+    ).replace(0, np.nan)
+
+    g["bb_position"] = (
+        close - g["bb_lower"]
+    ) / bb_width
+
+    g["bb_reclaim"] = (
+        (close > g["bb_lower"])
+        & (close.shift(1) <= g["bb_lower"].shift(1))
+    )
+
+    # -----------------------------
+    # ADX
+    # -----------------------------
+    g["adx14"] = adx(
+        high,
+        low,
+        close,
+        14
+    )
+
+    # -----------------------------
+    # Stochastic
+    # -----------------------------
+    lowest14 = low.rolling(
+        14,
+        min_periods=14
+    ).min()
+
+    highest14 = high.rolling(
+        14,
+        min_periods=14
+    ).max()
+
+    denominator = (
+        highest14 - lowest14
+    ).replace(0, np.nan)
+
+    g["stoch_k"] = (
+        100
+        * (close - lowest14)
+        / denominator
+    )
+
+    g["stoch_d"] = g["stoch_k"].rolling(
+        3,
+        min_periods=3
+    ).mean()
+
+    g["stoch_rebound"] = (
+        (g["stoch_k"] > g["stoch_d"])
+        & (
+            g["stoch_k"].shift(1)
+            <= g["stoch_d"].shift(1)
+        )
+    )
+
+    # -----------------------------
+    # Previous-day Pivot
+    # -----------------------------
+    previous_high = high.shift(1)
+    previous_low = low.shift(1)
+    previous_close = close.shift(1)
+
+    pivot = (
+        previous_high
+        + previous_low
+        + previous_close
+    ) / 3
+
+    g["pivot"] = pivot
+
+    g["pivot_r1"] = (
+        2 * pivot
+        - previous_low
+    )
+
+    g["pivot_s1"] = (
+        2 * pivot
+        - previous_high
+    )
+
+    g["pivot_r2"] = (
+        pivot
+        + (previous_high - previous_low)
+    )
+
+    g["pivot_s2"] = (
+        pivot
+        - (previous_high - previous_low)
+    )
+
+    # -----------------------------
+    # Candlestick reversal signals
+    # -----------------------------
+    body = (close - open_).abs()
+
+    candle_range = (
+        high - low
+    ).replace(0, np.nan)
+
+    lower_wick = (
+        np.minimum(open_, close) - low
+    )
+
+    upper_wick = (
+        high - np.maximum(open_, close)
+    )
+
+    g["hammer"] = (
+        (lower_wick >= body * 2)
+        & (upper_wick <= body)
+        & ((body / candle_range) <= 0.40)
+    )
+
+    previous_open = open_.shift(1)
+    previous_close = close.shift(1)
+
+    g["bullish_engulfing"] = (
+        (previous_close < previous_open)
+        & (close > open_)
+        & (open_ <= previous_close)
+        & (close >= previous_open)
+    )
+
+    # -----------------------------
+    # Individual research signals
+    # -----------------------------
+    g["rsi_oversold"] = g["rsi14"] < 30
+    g["rsi_overbought"] = g["rsi14"] > 70
+
+    g["above_ema20"] = close > g["ema20"]
+    g["above_ema50"] = close > g["ema50"]
+
+    g["volume_1_5x"] = g["volume_ratio20"] >= 1.5
+    g["volume_2x"] = g["volume_ratio20"] >= 2.0
+
+    g["momentum_positive"] = g["momentum20"] > 0
+    g["momentum_5pct"] = g["momentum20"] > 0.05
+    g["momentum_10pct"] = g["momentum20"] > 0.10
+
+    g["adx_strong"] = g["adx14"] >= 25
+
+    g["stoch_oversold"] = g["stoch_k"] < 20
+
+    g["near_support"] = (
+        (g["distance_support20"] >= 0)
+        & (g["distance_support20"] <= 0.03)
+    )
+
+    g["near_resistance"] = (
+        (g["distance_resistance20"] <= 0)
+        & (g["distance_resistance20"] >= -0.03)
+    )
+
+    # Useful for breakdown/reversal research:
+    # after breaking the 20D low, price can still be
+    # close to the deeper 50D support.
+    g["near_support50"] = (
+        (g["distance_support50"] >= 0)
+        & (g["distance_support50"] <= 0.05)
+    )
+
+    g["below_bb_lower"] = (
+        close < g["bb_lower"]
+    )
+
+    g["above_pivot"] = (
+        close > g["pivot"]
+    )
+
+    g["below_pivot"] = (
+        close < g["pivot"]
+    )
+
+    # -----------------------------
+    # Composite research scores
     #
-    # This prevents today's price from
-    # being used to calculate today's
-    # previous 20-day high.
-    # ------------------------------
-
-    df["previous_high20"] = groups["high"].transform(
-        lambda x: x.shift(1).rolling(20).max()
+    # These are NOT recommendations.
+    # They exist to discover useful
+    # combinations statistically.
+    # -----------------------------
+    g["trend_score"] = (
+        g["above_ema20"].astype("int8")
+        + g["above_ema50"].astype("int8")
+        + g["momentum_positive"].astype("int8")
+        + g["adx_strong"].astype("int8")
+        + g["above_pivot"].astype("int8")
     )
 
-    df["previous_low20"] = groups["low"].transform(
-        lambda x: x.shift(1).rolling(20).min()
+    g["reversal_score"] = (
+        g["rsi_oversold"].astype("int8")
+        + g["stoch_oversold"].astype("int8")
+        + g["near_support"].astype("int8")
+        + g["below_bb_lower"].astype("int8")
+        + g["hammer"].astype("int8")
+        + g["bullish_engulfing"].astype("int8")
+        + g["breakdown20"].astype("int8")
     )
 
-    df["breakout20"] = (
-        df["close"] >
-        df["previous_high20"]
+    # Main candidate score.
+    g["main_score"] = (
+        g["above_ema20"].astype("int8")
+        + g["above_ema50"].astype("int8")
+        + g["momentum_positive"].astype("int8")
+        + g["volume_1_5x"].astype("int8")
+        + g["above_pivot"].astype("int8")
+        + g["adx_strong"].astype("int8")
+        + g["near_support"].astype("int8")
     )
 
-    df["breakdown20"] = (
-        df["close"] <
-        df["previous_low20"]
-    )
+    # -----------------------------
+    # NEXT-DAY OPEN ENTRY
+    #
+    # Signal is known at T close.
+    # Entry = T+1 OPEN.
+    # Exit = T+horizon CLOSE.
+    # -----------------------------
+    g["entry_open"] = open_.shift(-1)
 
-    # ------------------------------
-    # Trend
-    # ------------------------------
+    for horizon in HORIZONS:
+        g[f"exit_close_{horizon}"] = close.shift(
+            -horizon
+        )
 
-    df["trend_up_ema50"] = (
-        df["close"] >
-        df["ema50"]
-    )
+        g[f"forward_return_{horizon}"] = (
+            g[f"exit_close_{horizon}"]
+            / g["entry_open"]
+            - 1
+        )
 
-    df["trend_up_ema200"] = (
-        (df["close"] > df["ema200"]) &
-        (df["ema50"] > df["ema200"])
-    )
-
-    return df
+    return g
 
 
-# ============================================================
-# FUTURE RETURNS
-# ============================================================
+def build_features(df):
+    pieces = []
 
-def add_future_returns(df, horizons):
-
-    df = df.sort_values(
-        ["symbol", "date"]
-    ).copy()
-
-    groups = df.groupby(
+    for _, group in df.groupby(
         "symbol",
-        group_keys=False
-    )
-
-    for horizon in horizons:
-
-        df[f"future_close_{horizon}d"] = groups[
-            "close"
-        ].shift(-horizon)
-
-        df[f"future_return_{horizon}d"] = (
-            df[f"future_close_{horizon}d"] /
-            df["close"]
-        ) - 1
-
-        df[f"future_win_{horizon}d"] = (
-            df[f"future_return_{horizon}d"] > 0
-        )
-
-    return df
-
-
-# ============================================================
-# INDIVIDUAL INDICATOR TESTS
-# ============================================================
-
-def test_indicator(
-    df,
-    name,
-    condition,
-    horizons
-):
-
-    selected = df.loc[
-        condition
-    ].copy()
-
-    results = []
-
-    for horizon in horizons:
-
-        column = (
-            f"future_return_{horizon}d"
-        )
-
-        values = selected[column].dropna()
-
-        if len(values) == 0:
+        sort=False
+    ):
+        if len(group) < (
+            MIN_HISTORY
+            + max(HORIZONS)
+            + 1
+        ):
             continue
 
-        positive = (
-            values > 0
-        ).sum()
-
-        negative = (
-            values <= 0
-        ).sum()
-
-        avg_return = values.mean()
-
-        median_return = values.median()
-
-        gross_profit = (
-            values[values > 0].sum()
+        pieces.append(
+            add_features(group)
         )
 
-        gross_loss = (
-            -values[values < 0].sum()
+    if not pieces:
+        raise RuntimeError(
+            "No symbol has enough history "
+            "for the new test."
         )
+
+    return pd.concat(
+        pieces,
+        ignore_index=True
+    )
+
+
+def summarize(mask, df, label):
+    selected = df.loc[
+        mask.fillna(False)
+    ].copy()
+
+    rows = []
+
+    for horizon in HORIZONS:
+        returns = pd.to_numeric(
+            selected[
+                f"forward_return_{horizon}"
+            ],
+            errors="coerce"
+        ).dropna()
+
+        if returns.empty:
+            continue
+
+        positive = returns[returns > 0]
+        negative = returns[returns < 0]
+
+        gross_profit = positive.sum()
+        gross_loss = -negative.sum()
 
         if gross_loss > 0:
             profit_factor = (
-                gross_profit /
-                gross_loss
+                gross_profit
+                / gross_loss
             )
         else:
-            profit_factor = math.inf
+            profit_factor = np.nan
 
-        results.append({
-
-            "rule": name,
-
+        rows.append({
+            "rule": label,
             "horizon_days": horizon,
-
-            "signals": len(values),
-
-            "win_rate": positive / len(values),
-
-            "loss_rate": negative / len(values),
-
-            "average_return": avg_return,
-
-            "median_return": median_return,
-
-            "best_return": values.max(),
-
-            "worst_return": values.min(),
-
-            "profit_factor": profit_factor
-        })
-
-    return results
-
-
-# ============================================================
-# RUN INDICATOR RESEARCH
-# ============================================================
-
-def run_indicator_tests(df, horizons):
-
-    tests = []
-
-    rules = {
-
-        "RSI < 30":
-            df["rsi14"] < 30,
-
-        "RSI > 70":
-            df["rsi14"] > 70,
-
-        "RSI 45-70":
-            (
-                (df["rsi14"] >= 45) &
-                (df["rsi14"] <= 70)
+            "signals": int(len(returns)),
+            "win_rate": float(
+                (returns > 0).mean()
             ),
-
-        "Close > EMA20":
-            df["close"] > df["ema20"],
-
-        "Close > EMA50":
-            df["close"] > df["ema50"],
-
-        "EMA50 > EMA200":
-            df["ema50"] > df["ema200"],
-
-        "Volume >= 1.5x":
-            df["volume_ratio"] >= 1.5,
-
-        "Volume >= 2x":
-            df["volume_ratio"] >= 2,
-
-        "20D Breakout":
-            df["breakout20"] == True,
-
-        "20D Momentum > 0":
-            df["return_20d"] > 0,
-
-        "20D Momentum > 5%":
-            df["return_20d"] > 0.05,
-
-        "20D Momentum > 10%":
-            df["return_20d"] > 0.10,
-
-        "20D Breakdown":
-            df["breakdown20"] == True
-    }
-
-    for name, condition in rules.items():
-
-        valid_condition = (
-            condition &
-            df["close"].notna()
-        )
-
-        tests.extend(
-            test_indicator(
-                df,
-                name,
-                valid_condition,
-                horizons
-            )
-        )
-
-    return pd.DataFrame(tests)
-
-
-# ============================================================
-# COMBINED SIGNAL TEST
-# ============================================================
-
-def create_baseline_signal(df):
-
-    score = pd.Series(
-        0,
-        index=df.index,
-        dtype="int64"
-    )
-
-    # Trend
-    score += (
-        df["close"] >
-        df["ema50"]
-    ).astype(int)
-
-    # Momentum
-    score += (
-        df["return_20d"] > 0
-    ).astype(int)
-
-    # Volume
-    score += (
-        df["volume_ratio"] >= 1.5
-    ).astype(int)
-
-    # Breakout
-    score += (
-        df["breakout20"]
-    ).astype(int)
-
-    # Healthy RSI
-    score += (
-        (df["rsi14"] >= 45) &
-        (df["rsi14"] <= 70)
-    ).astype(int)
-
-    df["baseline_score"] = score
-
-    # Require at least 3 independent conditions
-    df["baseline_signal"] = (
-        score >= 3
-    )
-
-    return df
-
-
-def test_baseline(df, horizons):
-
-    selected = df[
-        df["baseline_signal"]
-    ].copy()
-
-    results = []
-
-    for horizon in horizons:
-
-        column = (
-            f"future_return_{horizon}d"
-        )
-
-        values = selected[
-            column
-        ].dropna()
-
-        if len(values) == 0:
-            continue
-
-        results.append({
-
-            "strategy":
-                "Baseline score >= 3",
-
-            "horizon_days":
-                horizon,
-
-            "signals":
-                len(values),
-
-            "win_rate":
-                float((values > 0).mean()),
-
-            "average_return":
-                float(values.mean()),
-
-            "median_return":
-                float(values.median()),
-
-            "best_return":
-                float(values.max()),
-
-            "worst_return":
-                float(values.min())
+            "loss_rate": float(
+                (returns < 0).mean()
+            ),
+            "average_return": float(
+                returns.mean()
+            ),
+            "median_return": float(
+                returns.median()
+            ),
+            "p10_return": float(
+                returns.quantile(0.10)
+            ),
+            "p25_return": float(
+                returns.quantile(0.25)
+            ),
+            "p75_return": float(
+                returns.quantile(0.75)
+            ),
+            "p90_return": float(
+                returns.quantile(0.90)
+            ),
+            "best_return": float(
+                returns.max()
+            ),
+            "worst_return": float(
+                returns.min()
+            ),
+            "profit_factor": (
+                float(profit_factor)
+                if not math.isnan(profit_factor)
+                else None
+            ),
         })
 
-    return pd.DataFrame(results)
+    return rows
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
+    df, files, failed = load_data()
 
-    print("=" * 70)
-    print("NASDAQ BACKTEST ENGINE V2")
-    print("=" * 70)
+    features = build_features(df)
 
-    print()
-    print("SOURCE:")
-    print(DATA_DIR)
+    # --------------------------------
+    # Individual indicators
+    # --------------------------------
+    rules = {
+        "RSI < 30":
+            features["rsi_oversold"],
 
-    print()
-    print("IMPORTANT:")
-    print("Source files are READ ONLY.")
-    print("Nothing inside daily-data/ will be changed.")
+        "RSI > 70":
+            features["rsi_overbought"],
 
-    # --------------------------------------------------------
-    # Configuration
-    # --------------------------------------------------------
+        "Close > EMA20":
+            features["above_ema20"],
 
-    horizons = DEFAULT_HORIZONS
+        "Close > EMA50":
+            features["above_ema50"],
 
-    if CONFIG_FILE.exists():
+        "Volume >= 1.5x":
+            features["volume_1_5x"],
 
-        try:
+        "Volume >= 2x":
+            features["volume_2x"],
 
-            with open(
-                CONFIG_FILE,
-                "r",
-                encoding="utf-8"
-            ) as f:
+        "20D Breakout":
+            features["breakout20"],
 
-                config = json.load(f)
+        "20D Breakdown":
+            features["breakdown20"],
 
-            horizons = config.get(
-                "forward_days",
-                DEFAULT_HORIZONS
+        "20D Momentum > 0":
+            features["momentum_positive"],
+
+        "20D Momentum > 5%":
+            features["momentum_5pct"],
+
+        "20D Momentum > 10%":
+            features["momentum_10pct"],
+
+        "ADX >= 25":
+            features["adx_strong"],
+
+        "Stochastic < 20":
+            features["stoch_oversold"],
+
+        "Near 20D Support":
+            features["near_support"],
+
+        "Near 20D Resistance":
+            features["near_resistance"],
+
+        "Near 50D Support":
+            features["near_support50"],
+
+        "Below Bollinger Lower":
+            features["below_bb_lower"],
+
+        "Bollinger Reclaim":
+            features["bb_reclaim"],
+
+        "Bullish Hammer":
+            features["hammer"],
+
+        "Bullish Engulfing":
+            features["bullish_engulfing"],
+
+        "Above Previous Pivot":
+            features["above_pivot"],
+
+        "Below Previous Pivot":
+            features["below_pivot"],
+    }
+
+    indicator_rows = []
+
+    for label, mask in rules.items():
+        indicator_rows.extend(
+            summarize(
+                mask,
+                features,
+                label
             )
-
-        except Exception as e:
-
-            print(
-                "[WARNING] Could not read config:",
-                e
-            )
-
-    print()
-    print(
-        "Forward horizons:",
-        horizons
-    )
-
-    # --------------------------------------------------------
-    # Load
-    # --------------------------------------------------------
-
-    print()
-    print("Loading daily files...")
-
-    df, file_count, failed_files = (
-        load_daily_data()
-    )
-
-    print(
-        f"Files successfully read: {file_count}"
-    )
-
-    print(
-        f"Raw records: {len(df):,}"
-    )
-
-    # --------------------------------------------------------
-    # Clean
-    # --------------------------------------------------------
-
-    print()
-    print("Cleaning data...")
-
-    df = clean_data(df)
-
-    print(
-        f"Clean records: {len(df):,}"
-    )
-
-    print(
-        f"Unique symbols: {df['symbol'].nunique():,}"
-    )
-
-    print(
-        f"First date: {df['date'].min().date()}"
-    )
-
-    print(
-        f"Last date: {df['date'].max().date()}"
-    )
-
-    # --------------------------------------------------------
-    # Indicators
-    # --------------------------------------------------------
-
-    print()
-    print("Calculating indicators...")
-
-    df = add_indicators(df)
-
-    # --------------------------------------------------------
-    # Future outcomes
-    # --------------------------------------------------------
-
-    print(
-        "Calculating future outcomes..."
-    )
-
-    df = add_future_returns(
-        df,
-        horizons
-    )
-
-    # --------------------------------------------------------
-    # Indicator tests
-    # --------------------------------------------------------
-
-    print()
-    print("Testing individual indicators...")
-
-    indicator_results = (
-        run_indicator_tests(
-            df,
-            horizons
         )
-    )
 
-    # --------------------------------------------------------
-    # Baseline
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "Testing combined baseline..."
-    )
-
-    df = create_baseline_signal(
-        df
-    )
-
-    baseline_results = test_baseline(
-        df,
-        horizons
-    )
-
-    # --------------------------------------------------------
-    # Results directory
-    # --------------------------------------------------------
-
-    RESULTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # --------------------------------------------------------
-    # Save indicator results
-    # --------------------------------------------------------
-
-    indicator_results.to_csv(
-        RESULTS_DIR /
-        "indicator_test.csv",
+    pd.DataFrame(
+        indicator_rows
+    ).to_csv(
+        RESULTS_DIR / "indicator_test.csv",
         index=False
     )
 
-    # --------------------------------------------------------
-    # Save baseline
-    # --------------------------------------------------------
+    # --------------------------------
+    # Candidate strategy combinations
+    # --------------------------------
+    combinations = {
+        "Trend: EMA50 + Momentum":
+            features["above_ema50"]
+            & features["momentum_positive"],
 
-    baseline_results.to_csv(
-        RESULTS_DIR /
-        "baseline_test.csv",
+        "Trend: EMA50 + Volume":
+            features["above_ema50"]
+            & features["volume_1_5x"],
+
+        "Trend: EMA50 + ADX":
+            features["above_ema50"]
+            & features["adx_strong"],
+
+        "Trend: EMA50 + Volume + ADX":
+            features["above_ema50"]
+            & features["volume_1_5x"]
+            & features["adx_strong"],
+
+        "Reversal: Breakdown + RSI":
+            features["breakdown20"]
+            & features["rsi_oversold"],
+
+        "Reversal: Breakdown + Volume":
+            features["breakdown20"]
+            & features["volume_1_5x"],
+
+        "Reversal: Breakdown + 50D Support":
+            features["breakdown20"]
+            & features["near_support50"],
+
+        "Reversal: Breakdown + RSI + Volume":
+            features["breakdown20"]
+            & features["rsi_oversold"]
+            & features["volume_1_5x"],
+
+        "Reversal: RSI + Support":
+            features["rsi_oversold"]
+            & features["near_support"],
+
+        "Reversal: RSI + Stoch + Support":
+            features["rsi_oversold"]
+            & features["stoch_oversold"]
+            & features["near_support"],
+
+        "Reversal: BB Reclaim + RSI":
+            features["bb_reclaim"]
+            & features["rsi_oversold"],
+
+        "Reversal: Hammer + Support":
+            features["hammer"]
+            & features["near_support"],
+
+        "Reversal: Bull Engulf + Support":
+            features["bullish_engulfing"]
+            & features["near_support"],
+
+        "Breakout: Breakout + Volume":
+            features["breakout20"]
+            & features["volume_1_5x"],
+
+        "Breakout: Breakout + EMA50 + Volume":
+            features["breakout20"]
+            & features["above_ema50"]
+            & features["volume_1_5x"],
+    }
+
+    combination_rows = []
+
+    for label, mask in combinations.items():
+        combination_rows.extend(
+            summarize(
+                mask,
+                features,
+                label
+            )
+        )
+
+    pd.DataFrame(
+        combination_rows
+    ).to_csv(
+        RESULTS_DIR / "strategy_tests.csv",
         index=False
     )
 
-    # --------------------------------------------------------
-    # Save detailed research data
-    # --------------------------------------------------------
+    # --------------------------------
+    # Main research score
+    # --------------------------------
+    main_mask = (
+        features["main_score"] >= 4
+    )
 
-    useful_columns = [
+    baseline_rows = summarize(
+        main_mask,
+        features,
+        "Main score >= 4"
+    )
 
-        "date",
-        "symbol",
-
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-
-        "market_cap",
-        "sector",
-        "industry",
-        "name",
-
-        "rsi14",
-
-        "ema20",
-        "ema50",
-        "ema200",
-
-        "sma20",
-        "sma50",
-
-        "atr14",
-
-        "volume_ratio",
-
-        "return_1d",
-        "return_5d",
-        "return_20d",
-
-        "breakout20",
-        "breakdown20",
-
-        "baseline_score",
-        "baseline_signal"
-    ]
-
-    for horizon in horizons:
-
-        useful_columns.extend([
-            f"future_close_{horizon}d",
-            f"future_return_{horizon}d",
-            f"future_win_{horizon}d"
-        ])
-
-    useful_columns = [
-        c for c in useful_columns
-        if c in df.columns
-    ]
-
-    df[useful_columns].to_csv(
-        RESULTS_DIR /
-        "research_dataset.csv",
+    pd.DataFrame(
+        baseline_rows
+    ).to_csv(
+        RESULTS_DIR / "baseline_test.csv",
         index=False
     )
 
-    # --------------------------------------------------------
+    # --------------------------------
     # Summary
-    # --------------------------------------------------------
-
+    # --------------------------------
     summary = {
-
         "engine":
-            "Nasdaq Backtest Engine V2",
+            "Nasdaq Backtest Engine V3",
 
         "generated_utc":
-            datetime.utcnow().isoformat() + "Z",
+            pd.Timestamp.now(
+                tz="UTC"
+            ).isoformat(),
 
         "source_directory":
             "daily-data/",
 
         "source_files_read":
-            file_count,
+            len(files),
 
         "failed_files":
-            len(failed_files),
+            len(failed),
 
         "records_after_cleaning":
             int(len(df)),
@@ -958,104 +883,78 @@ def main():
             str(df["date"].max().date()),
 
         "forward_horizons":
-            horizons,
+            HORIZONS,
+
+        "entry_rule":
+            "Signal at T close; enter at T+1 open",
+
+        "exit_rule":
+            "Exit at T+horizon close",
+
+        "minimum_history_days":
+            MIN_HISTORY,
+
+        "features_included": [
+            "RSI 14",
+            "EMA 20",
+            "EMA 50",
+            "SMA 20",
+            "ATR 14",
+            "Volume Ratio 20",
+            "20D Support",
+            "20D Resistance",
+            "50D Support",
+            "50D Resistance",
+            "20D Breakout",
+            "20D Breakdown",
+            "5D Momentum",
+            "20D Momentum",
+            "Bollinger Bands",
+            "ADX 14",
+            "Stochastic",
+            "Previous-day Pivot",
+            "Pivot R1/R2",
+            "Pivot S1/S2",
+            "Hammer",
+            "Bullish Engulfing"
+        ],
 
         "source_files_modified":
             False,
 
         "warning":
-            "Research statistics only. No investment recommendation."
+            "Research statistics only. "
+            "No investment recommendation."
     }
 
-    with open(
-        RESULTS_DIR / "summary.json",
+    with (
+        RESULTS_DIR
+        / "summary.json"
+    ).open(
         "w",
         encoding="utf-8"
     ) as f:
-
         json.dump(
             summary,
             f,
+            ensure_ascii=False,
             indent=2
         )
 
-    # --------------------------------------------------------
-    # Print results
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("TEST COMPLETE")
-    print("=" * 70)
-
-    print()
-
     print(
-        "Results saved to:"
+        "Nasdaq Backtest Engine V3 completed."
     )
 
     print(
-        "results/indicator_test.csv"
+        f"Rows: {len(df):,}"
     )
 
     print(
-        "results/baseline_test.csv"
+        f"Symbols: {df['symbol'].nunique():,}"
     )
 
     print(
-        "results/research_dataset.csv"
-    )
-
-    print(
-        "results/summary.json"
-    )
-
-    print()
-
-    if not indicator_results.empty:
-
-        display = (
-            indicator_results
-            .sort_values(
-                [
-                    "horizon_days",
-                    "average_return"
-                ],
-                ascending=[
-                    True,
-                    False
-                ]
-            )
-            .head(30)
-        )
-
-        print(
-            "TOP INDICATOR RESULTS:"
-        )
-
-        print(
-            display.to_string(
-                index=False
-            )
-        )
-
-    print()
-
-    if not baseline_results.empty:
-
-        print(
-            "BASELINE RESULTS:"
-        )
-
-        print(
-            baseline_results.to_string(
-                index=False
-            )
-        )
-
-    print()
-    print(
-        "Finished safely. daily-data/ was not modified."
+        "Results written to results/."
     )
 
 
