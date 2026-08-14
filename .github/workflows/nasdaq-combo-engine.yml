@@ -1,0 +1,35 @@
+name: Nasdaq Combo Engine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  combo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Run Nasdaq Combo Engine V2
+        run: python engines/nasdaq_combo_engine_v2.py
+
+      - name: Commit combo results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results_combo
+          git diff --cached --quiet || git commit -m "Update Nasdaq combo engine results"
+          git push
