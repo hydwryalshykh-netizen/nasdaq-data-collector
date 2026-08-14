@@ -1,0 +1,20 @@
+{
+  "engine": "Nasdaq Backtest Engine V2",
+  "generated_utc": "2026-08-14T11:04:01.209883Z",
+  "source_directory": "daily-data/",
+  "source_files_read": 155,
+  "failed_files": 0,
+  "records_after_cleaning": 561109,
+  "unique_symbols": 4260,
+  "first_date": "2026-01-02",
+  "last_date": "2026-08-14",
+  "forward_horizons": [
+    1,
+    3,
+    5,
+    10,
+    20
+  ],
+  "source_files_modified": false,
+  "warning": "Research statistics only. No investment recommendation."
+}
