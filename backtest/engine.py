@@ -1,1072 +1,224 @@
-import json
-import math
-from pathlib import Path
+# Nasdaq Combo Engine V1
+# Pure formula backtest: separates 10-day and 20-day winners,
+# combines them with OR / consensus voting, then performs OOS checking.
 
+import json
+from itertools import combinations
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "daily-data"
-RESULTS_DIR = ROOT / "results"
+RESULTS_DIR = ROOT / "results_combo"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-HORIZONS = [1, 3, 5, 10, 20]
-MIN_HISTORY = 60
+HORIZONS = [10, 20]
+MIN_HISTORY = 120
+MIN_SIGNALS = 100
+BASE_WIN_SCORE = 55.0
 
+CANDIDATES = {
+    "RSI + 20D Support": lambda x: x.rsi_oversold & x.near_support20,
+    "RSI + Stoch + Support": lambda x: x.rsi_oversold & x.stoch_oversold & x.near_support20,
+    "Hammer + Support": lambda x: x.hammer & x.near_support20,
+    "Bull Engulf + Support": lambda x: x.bullish_engulfing & x.near_support20,
+    "50D Support + RSI": lambda x: x.near_support50 & x.rsi_oversold,
+    "50D Support + RSI + Higher Low": lambda x: x.near_support50 & x.rsi_oversold & x.higher_low,
+    "50D Support + Hammer": lambda x: x.near_support50 & x.hammer,
+    "Support Rejection + RSI": lambda x: x.support_rejection & x.rsi_oversold,
+    "Bottom Reclaim + Support": lambda x: x.bottom_reclaim & x.near_support50,
+    "100D Support + RSI": lambda x: x.near_support100 & x.rsi_oversold,
+    "Breakdown + 50D Support": lambda x: x.breakdown20 & x.near_support50,
+    "Breakdown + RSI": lambda x: x.breakdown20 & x.rsi_oversold,
+    "BB Reclaim + RSI": lambda x: x.bb_reclaim & x.rsi_oversold,
+    "Hammer + RSI + Support": lambda x: x.hammer & x.rsi_oversold & x.near_support20,
+    "Bull Engulf + RSI + Support": lambda x: x.bullish_engulfing & x.rsi_oversold & x.near_support20,
+    "Support Rejection + RSI + Volume": lambda x: x.support_rejection & x.rsi_oversold & x.volume_1_5x,
+}
 
 def load_data():
-    rows = []
-    files = sorted(DATA_DIR.glob("*.json"))
-    failed = []
-
-    for path in files:
+    rows, failed = [], []
+    for p in sorted(DATA_DIR.glob("*.json")):
         try:
-            with path.open("r", encoding="utf-8") as f:
-                obj = json.load(f)
-
-            records = obj.get("records", [])
-            if not isinstance(records, list):
-                raise ValueError("records is not a list")
-
-            rows.extend(records)
-
-        except Exception as exc:
-            failed.append({"file": path.name, "error": str(exc)})
-
-    if not rows:
-        raise RuntimeError("No usable records found in daily-data/")
-
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            rec = obj.get("records", [])
+            if not isinstance(rec, list): raise ValueError("records is not a list")
+            rows.extend(rec)
+        except Exception as e:
+            failed.append({"file": p.name, "error": str(e)})
+    if not rows: raise RuntimeError(f"No usable records in {DATA_DIR}")
     df = pd.DataFrame(rows)
-
-    required = ["symbol", "date", "open", "high", "low", "close", "volume"]
-    for col in required:
-        if col not in df.columns:
-            raise RuntimeError(f"Missing required column: {col}")
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=required).copy()
-
-    df = df[
-        (df["open"] > 0)
-        & (df["high"] > 0)
-        & (df["low"] > 0)
-        & (df["close"] > 0)
-    ]
-
-    # Basic OHLC validation.
-    df = df[df["high"] >= df[["open", "close", "low"]].max(axis=1)]
-    df = df[df["low"] <= df[["open", "close", "high"]].min(axis=1)]
-
-    df = df.drop_duplicates(
-        subset=["symbol", "date"],
-        keep="last"
-    )
-
-    df = df.sort_values(
-        ["symbol", "date"]
-    ).reset_index(drop=True)
-
-    return df, files, failed
-
-
-def rsi(series, period=14):
-    delta = series.diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    result = 100 - (100 / (1 + rs))
-
-    result = result.where(avg_loss != 0, 100)
-    result = result.where(
-        ~((avg_gain == 0) & (avg_loss == 0)),
-        50
-    )
-
-    return result
-
-
-def atr(high, low, close, period=14):
-    previous_close = close.shift(1)
-
-    true_range = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-
-def adx(high, low, close, period=14):
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = up_move.where(
-        (up_move > down_move) & (up_move > 0),
-        0.0
-    )
-
-    minus_dm = down_move.where(
-        (down_move > up_move) & (down_move > 0),
-        0.0
-    )
-
-    true_range = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
-        axis=1
-    ).max(axis=1)
-
-    tr_avg = true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    plus_avg = plus_dm.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    minus_avg = minus_dm.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    plus_di = 100 * plus_avg / tr_avg.replace(0, np.nan)
-    minus_di = 100 * minus_avg / tr_avg.replace(0, np.nan)
-
-    dx = (
-        100
-        * (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(0, np.nan)
-    )
-
-    return dx.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-
-def add_features(group):
-    g = group.sort_values("date").copy()
-
-    close = g["close"]
-    high = g["high"]
-    low = g["low"]
-    open_ = g["open"]
-    volume = g["volume"]
-
-    # -----------------------------
-    # Trend
-    # -----------------------------
-    g["ema20"] = close.ewm(
-        span=20,
-        adjust=False,
-        min_periods=20
-    ).mean()
-
-    g["ema50"] = close.ewm(
-        span=50,
-        adjust=False,
-        min_periods=50
-    ).mean()
-
-    g["sma20"] = close.rolling(
-        20,
-        min_periods=20
-    ).mean()
-
-    # -----------------------------
-    # Momentum / volatility
-    # -----------------------------
-    g["rsi14"] = rsi(close, 14)
-
-    g["atr14"] = atr(
-        high,
-        low,
-        close,
-        14
-    )
-
-    g["atr_pct"] = g["atr14"] / close
-
-    g["momentum5"] = close / close.shift(5) - 1
-    g["momentum20"] = close / close.shift(20) - 1
-
-    # -----------------------------
-    # Volume
-    # -----------------------------
-    g["volume_avg20"] = volume.rolling(
-        20,
-        min_periods=20
-    ).mean()
-
-    g["volume_ratio20"] = (
-        volume
-        / g["volume_avg20"].replace(0, np.nan)
-    )
-
-    # -----------------------------
-    # Support / resistance
-    #
-    # IMPORTANT:
-    # shift(1) means today's signal
-    # cannot use today's high/low.
-    # -----------------------------
-    g["resistance20"] = high.shift(1).rolling(
-        20,
-        min_periods=20
-    ).max()
-
-    g["support20"] = low.shift(1).rolling(
-        20,
-        min_periods=20
-    ).min()
-
-    g["resistance50"] = high.shift(1).rolling(
-        50,
-        min_periods=50
-    ).max()
-
-    g["support50"] = low.shift(1).rolling(
-        50,
-        min_periods=50
-    ).min()
-
-    g["resistance100"] = high.shift(1).rolling(
-        100,
-        min_periods=100
-    ).max()
-
-    g["support100"] = low.shift(1).rolling(
-        100,
-        min_periods=100
-    ).min()
-
-    g["distance_support100"] = (
-        close / g["support100"] - 1
-    )
-
-    g["distance_resistance50"] = (
-        close / g["resistance50"] - 1
-    )
-
-    g["distance_resistance100"] = (
-        close / g["resistance100"] - 1
-    )
-
-    g["distance_support20"] = (
-        close / g["support20"] - 1
-    )
-
-    g["distance_resistance20"] = (
-        close / g["resistance20"] - 1
-    )
-
-    g["distance_support50"] = (
-        close / g["support50"] - 1
-    )
-
-    # -----------------------------
-    # Breakout / breakdown
-    # -----------------------------
-    g["breakout20"] = (
-        close > g["resistance20"]
-    )
-
-    g["breakdown20"] = (
-        close < g["support20"]
-    )
-
-    # -----------------------------
-    # Bollinger Bands
-    # -----------------------------
-    bb_mid = close.rolling(
-        20,
-        min_periods=20
-    ).mean()
-
-    bb_std = close.rolling(
-        20,
-        min_periods=20
-    ).std(ddof=0)
-
-    g["bb_mid"] = bb_mid
-    g["bb_upper"] = bb_mid + 2 * bb_std
-    g["bb_lower"] = bb_mid - 2 * bb_std
-
-    bb_width = (
-        g["bb_upper"] - g["bb_lower"]
-    ).replace(0, np.nan)
-
-    g["bb_position"] = (
-        close - g["bb_lower"]
-    ) / bb_width
-
-    g["bb_reclaim"] = (
-        (close > g["bb_lower"])
-        & (close.shift(1) <= g["bb_lower"].shift(1))
-    )
-
-    # -----------------------------
-    # ADX
-    # -----------------------------
-    g["adx14"] = adx(
-        high,
-        low,
-        close,
-        14
-    )
-
-    # -----------------------------
-    # Stochastic
-    # -----------------------------
-    lowest14 = low.rolling(
-        14,
-        min_periods=14
-    ).min()
-
-    highest14 = high.rolling(
-        14,
-        min_periods=14
-    ).max()
-
-    denominator = (
-        highest14 - lowest14
-    ).replace(0, np.nan)
-
-    g["stoch_k"] = (
-        100
-        * (close - lowest14)
-        / denominator
-    )
-
-    g["stoch_d"] = g["stoch_k"].rolling(
-        3,
-        min_periods=3
-    ).mean()
-
-    g["stoch_rebound"] = (
-        (g["stoch_k"] > g["stoch_d"])
-        & (
-            g["stoch_k"].shift(1)
-            <= g["stoch_d"].shift(1)
-        )
-    )
-
-    # -----------------------------
-    # Previous-day Pivot
-    # -----------------------------
-    previous_high = high.shift(1)
-    previous_low = low.shift(1)
-    previous_close = close.shift(1)
-
-    pivot = (
-        previous_high
-        + previous_low
-        + previous_close
-    ) / 3
-
-    g["pivot"] = pivot
-
-    g["pivot_r1"] = (
-        2 * pivot
-        - previous_low
-    )
-
-    g["pivot_s1"] = (
-        2 * pivot
-        - previous_high
-    )
-
-    g["pivot_r2"] = (
-        pivot
-        + (previous_high - previous_low)
-    )
-
-    g["pivot_s2"] = (
-        pivot
-        - (previous_high - previous_low)
-    )
-
-    # -----------------------------
-    # Candlestick reversal signals
-    # -----------------------------
-    body = (close - open_).abs()
-
-    candle_range = (
-        high - low
-    ).replace(0, np.nan)
-
-    lower_wick = (
-        np.minimum(open_, close) - low
-    )
-
-    upper_wick = (
-        high - np.maximum(open_, close)
-    )
-
-    g["hammer"] = (
-        (lower_wick >= body * 2)
-        & (upper_wick <= body)
-        & ((body / candle_range) <= 0.40)
-    )
-
-    previous_open = open_.shift(1)
-    previous_close = close.shift(1)
-
-    g["bullish_engulfing"] = (
-        (previous_close < previous_open)
-        & (close > open_)
-        & (open_ <= previous_close)
-        & (close >= previous_open)
-    )
-
-    # -----------------------------
-    # Price-structure / bottom signals
-    # -----------------------------
-    # All rolling extrema use only prior bars for the signal decision.
-    prior10_low = low.shift(1).rolling(10, min_periods=10).min()
-    prior10_high = high.shift(1).rolling(10, min_periods=10).max()
-    prior20_low = low.shift(1).rolling(20, min_periods=20).min()
-    prior20_high = high.shift(1).rolling(20, min_periods=20).max()
-
-    g["near_support100"] = (
-        (g["distance_support100"] >= 0)
-        & (g["distance_support100"] <= 0.05)
-    )
-
-    g["near_resistance50"] = (
-        (g["distance_resistance50"] <= 0)
-        & (g["distance_resistance50"] >= -0.03)
-    )
-
-    g["near_resistance100"] = (
-        (g["distance_resistance100"] <= 0)
-        & (g["distance_resistance100"] >= -0.03)
-    )
-
-    # Higher-low structure: today's low is above the prior 10-day low
-    # while price has recently recovered from a local low.
-    g["higher_low"] = (
-        (low > prior10_low)
-        & (close > close.shift(1))
-        & (close > g["support20"])
-    )
-
-    # Recovery from a recent 20D low without using today's low to define it.
-    g["bottom_reclaim"] = (
-        (close > prior20_low)
-        & (close.shift(1) <= prior20_low.shift(1))
-    )
-
-    # Rejection of support: intraday low reaches support area but closes back above it.
-    g["support_rejection"] = (
-        (low <= g["support20"] * 1.01)
-        & (close > g["support20"])
-        & (close > open_)
-    )
-
-    # Breakout confirmation / retest style conditions.
-    g["breakout_retest"] = (
-        (close > g["resistance20"])
-        & (low <= g["resistance20"] * 1.02)
-        & (close > open_)
-    )
-
-    g["resistance_rejection"] = (
-        (high >= g["resistance20"] * 0.99)
-        & (close < g["resistance20"])
-        & (close < open_)
-    )
-
-    # -----------------------------
-    # Individual research signals
-    # -----------------------------
-    g["rsi_oversold"] = g["rsi14"] < 30
-    g["rsi_overbought"] = g["rsi14"] > 70
-
-    g["above_ema20"] = close > g["ema20"]
-    g["above_ema50"] = close > g["ema50"]
-
-    g["volume_1_5x"] = g["volume_ratio20"] >= 1.5
-    g["volume_2x"] = g["volume_ratio20"] >= 2.0
-
-    g["momentum_positive"] = g["momentum20"] > 0
-    g["momentum_5pct"] = g["momentum20"] > 0.05
-    g["momentum_10pct"] = g["momentum20"] > 0.10
-
-    g["adx_strong"] = g["adx14"] >= 25
-
-    g["stoch_oversold"] = g["stoch_k"] < 20
-
-    g["near_support"] = (
-        (g["distance_support20"] >= 0)
-        & (g["distance_support20"] <= 0.03)
-    )
-
-    g["near_resistance"] = (
-        (g["distance_resistance20"] <= 0)
-        & (g["distance_resistance20"] >= -0.03)
-    )
-
-    # Useful for breakdown/reversal research:
-    # after breaking the 20D low, price can still be
-    # close to the deeper 50D support.
-    g["near_support50"] = (
-        (g["distance_support50"] >= 0)
-        & (g["distance_support50"] <= 0.05)
-    )
-
-    g["below_bb_lower"] = (
-        close < g["bb_lower"]
-    )
-
-    g["above_pivot"] = (
-        close > g["pivot"]
-    )
-
-    g["below_pivot"] = (
-        close < g["pivot"]
-    )
-
-    # -----------------------------
-    # Composite research scores
-    #
-    # These are NOT recommendations.
-    # They exist to discover useful
-    # combinations statistically.
-    # -----------------------------
-    g["trend_score"] = (
-        g["above_ema20"].astype("int8")
-        + g["above_ema50"].astype("int8")
-        + g["momentum_positive"].astype("int8")
-        + g["adx_strong"].astype("int8")
-        + g["above_pivot"].astype("int8")
-    )
-
-    g["reversal_score"] = (
-        g["rsi_oversold"].astype("int8")
-        + g["stoch_oversold"].astype("int8")
-        + g["near_support"].astype("int8")
-        + g["below_bb_lower"].astype("int8")
-        + g["hammer"].astype("int8")
-        + g["bullish_engulfing"].astype("int8")
-        + g["breakdown20"].astype("int8")
-    )
-
-    # Main candidate score.
-    g["main_score"] = (
-        g["above_ema20"].astype("int8")
-        + g["above_ema50"].astype("int8")
-        + g["momentum_positive"].astype("int8")
-        + g["volume_1_5x"].astype("int8")
-        + g["above_pivot"].astype("int8")
-        + g["adx_strong"].astype("int8")
-        + g["near_support"].astype("int8")
-    )
-
-    # -----------------------------
-    # NEXT-DAY OPEN ENTRY
-    #
-    # Signal is known at T close.
-    # Entry = T+1 OPEN.
-    # Exit = T+horizon CLOSE.
-    # -----------------------------
-    g["entry_open"] = open_.shift(-1)
-
-    for horizon in HORIZONS:
-        g[f"exit_close_{horizon}"] = close.shift(
-            -horizon
-        )
-
-        g[f"forward_return_{horizon}"] = (
-            g[f"exit_close_{horizon}"]
-            / g["entry_open"]
-            - 1
-        )
-
+    req = ["symbol","date","open","high","low","close","volume"]
+    for c in req:
+        if c not in df.columns: raise RuntimeError(f"Missing column: {c}")
+    df.date = pd.to_datetime(df.date, errors="coerce")
+    for c in ["open","high","low","close","volume"]: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=req)
+    df = df[(df.open>0)&(df.high>0)&(df.low>0)&(df.close>0)&(df.volume>=0)]
+    df = df[df.high >= df[["open","close","low"]].max(axis=1)]
+    df = df[df.low <= df[["open","close","high"]].min(axis=1)]
+    df = df.drop_duplicates(["symbol","date"], keep="last").sort_values(["symbol","date"]).reset_index(drop=True)
+    return df, failed
+
+def rsi(c, n=14):
+    d=c.diff(); gain=d.clip(lower=0); loss=-d.clip(upper=0)
+    ag=gain.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    al=loss.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    rs=ag/al.replace(0,np.nan)
+    z=100-100/(1+rs)
+    z=z.where(al!=0,100).where(~((ag==0)&(al==0)),50)
+    return z
+
+def add_features(g):
+    g=g.sort_values("date").copy(); o,h,l,c,v=[g[x] for x in ["open","high","low","close","volume"]]
+    g["rsi14"]=rsi(c)
+    pc=c.shift(1)
+    tr=pd.concat([h-l,(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
+    g["atr14"]=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    g["volume_ratio20"]=v/v.rolling(20,min_periods=20).mean().replace(0,np.nan)
+    g["support20"]=l.shift(1).rolling(20,min_periods=20).min()
+    g["support50"]=l.shift(1).rolling(50,min_periods=50).min()
+    g["support100"]=l.shift(1).rolling(100,min_periods=100).min()
+    g["dist_support20"]=c/g.support20-1; g["dist_support50"]=c/g.support50-1; g["dist_support100"]=c/g.support100-1
+    g["near_support20"]=(g.dist_support20>=0)&(g.dist_support20<=.03)
+    g["near_support50"]=(g.dist_support50>=0)&(g.dist_support50<=.05)
+    g["near_support100"]=(g.dist_support100>=0)&(g.dist_support100<=.05)
+    g["rsi_oversold"]=g.rsi14<30
+    lo=l.rolling(14,min_periods=14).min(); hi=h.rolling(14,min_periods=14).max()
+    g["stoch_k"]=100*(c-lo)/(hi-lo).replace(0,np.nan); g["stoch_oversold"]=g.stoch_k<20
+    body=(c-o).abs(); rng=(h-l).replace(0,np.nan)
+    lower=np.minimum(o,c)-l; upper=h-np.maximum(o,c)
+    g["hammer"]=(lower>=body*2)&(upper<=body)&((body/rng)<=.40)
+    po=o.shift(1); pc2=c.shift(1)
+    g["bullish_engulfing"]=(pc2<po)&(c>o)&(o<=pc2)&(c>=po)
+    p10=l.shift(1).rolling(10,min_periods=10).min()
+    p20=l.shift(1).rolling(20,min_periods=20).min()
+    g["higher_low"]=(l>p10)&(c>c.shift(1))&(c>g.support20)
+    g["bottom_reclaim"]=(c>p20)&(c.shift(1)<=p20.shift(1))
+    g["support_rejection"]=(l<=g.support20*1.01)&(c>g.support20)&(c>o)
+    g["breakdown20"]=c<g.support20
+    bb=c.rolling(20,min_periods=20).mean(); sd=c.rolling(20,min_periods=20).std(ddof=0)
+    lowerbb=bb-2*sd
+    g["bb_reclaim"]=(c>lowerbb)&(c.shift(1)<=lowerbb.shift(1))
+    g["volume_1_5x"]=g.volume_ratio20>=1.5
+    g["entry_open"]=o.shift(-1)
+    for hzn in HORIZONS:
+        g[f"forward_return_{hzn}"]=c.shift(-hzn)/g.entry_open-1
     return g
 
-
 def build_features(df):
-    pieces = []
+    parts=[]
+    for _,grp in df.groupby("symbol",sort=False):
+        if len(grp)>=MIN_HISTORY+max(HORIZONS)+1: parts.append(add_features(grp))
+    if not parts: raise RuntimeError("No symbol has enough history.")
+    return pd.concat(parts,ignore_index=True)
 
-    for _, group in df.groupby(
-        "symbol",
-        sort=False
-    ):
-        if len(group) < (
-            MIN_HISTORY
-            + max(HORIZONS)
-            + 1
-        ):
-            continue
+def stats(r):
+    r=pd.Series(r).dropna().astype(float)
+    if r.empty: return None
+    wins=r[r>0]; losses=r[r<0]; gp=wins.sum(); gl=-losses.sum()
+    pf=gp/gl if gl>0 else np.inf; win=float((r>0).mean()); mean=float(r.mean()); med=float(r.median())
+    sample=min(1.,len(r)/1000.); pf_f=min(1.,max(0.,pf/1.5))
+    win_f=min(1.,max(0.,(win-.45)/.15)); med_f=min(1.,max(0.,med/.02)); mean_f=min(1.,max(0.,mean/.02))
+    n=max(1,int(len(r)*.01)) if len(r)>=20 else 0
+    robust=float(r.sort_values().iloc[:-n].mean()) if n else mean
+    robust_f=min(1.,max(0.,robust/.02))
+    score=100*sample*(.25*pf_f+.25*win_f+.15*med_f+.20*mean_f+.15*robust_f)
+    return dict(signals=len(r),win_rate=win,average_return=mean,median_return=med,
+                profit_factor=None if not np.isfinite(pf) else float(pf),
+                worst_return=float(r.min()),best_return=float(r.max()),robust_mean=robust,score=float(score))
 
-        pieces.append(
-            add_features(group)
-        )
+def mask_for(f,names,threshold=1):
+    votes=sum(CANDIDATES[n](f).fillna(False).astype(int) for n in names)
+    return votes>=threshold
 
-    if not pieces:
-        raise RuntimeError(
-            "No symbol has enough history "
-            "for the new test."
-        )
+def evaluate(mask,f,h):
+    return stats(f.loc[mask,f"forward_return_{h}"])
 
-    return pd.concat(
-        pieces,
-        ignore_index=True
-    )
+def base_tests(f):
+    rows=[]
+    for name,fn in CANDIDATES.items():
+        m=fn(f)
+        for h in HORIZONS:
+            s=evaluate(m,f,h)
+            if s: rows.append({"type":"base","horizon":h,"strategy":name,"threshold":1,**s})
+    return pd.DataFrame(rows)
 
+def select_winners(base):
+    out={}
+    for h in HORIZONS:
+        x=base[(base.horizon==h)&(base.signals>=MIN_SIGNALS)&(base.average_return>0)&(base.median_return>0)&(base.score>=BASE_WIN_SCORE)]
+        out[h]=x.sort_values(["score","average_return","win_rate"],ascending=False).head(8).strategy.tolist()
+    return out
 
-def summarize(mask, df, label):
-    selected = df.loc[mask.fillna(False)].copy()
-    rows = []
+def combo_tests(f,names,h):
+    rows=[]
+    for k in range(1,min(4,len(names))+1):
+        for combo in combinations(names,k):
+            label=" + ".join(combo)
+            for threshold in range(1,k+1):
+                m=mask_for(f,list(combo),threshold)
+                s=evaluate(m,f,h)
+                if s: rows.append({"type":f"{h}d_vote","horizon":h,"strategy":label,"threshold":threshold,**s})
+    return pd.DataFrame(rows)
 
-    for horizon in HORIZONS:
-        returns = pd.to_numeric(
-            selected[f"forward_return_{horizon}"],
-            errors="coerce"
-        ).dropna()
+def cross_pool(f,w10,w20):
+    rows=[]
+    for a in w10[:5]:
+        for b in w20[:5]:
+            if a==b: continue
+            m=CANDIDATES[a](f).fillna(False)&CANDIDATES[b](f).fillna(False)
+            for h in HORIZONS:
+                s=evaluate(m,f,h)
+                if s: rows.append({"type":"cross_pool_agreement","horizon":h,
+                                   "strategy":f"10D:{a} + 20D:{b}","threshold":2,**s})
+    return pd.DataFrame(rows)
 
-        if returns.empty:
-            continue
-
-        positive = returns[returns > 0]
-        negative = returns[returns < 0]
-        gross_profit = positive.sum()
-        gross_loss = -negative.sum()
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
-
-        # Robustness diagnostics: determine whether the mean is dominated by
-        # a tiny number of extreme winners. This is a research diagnostic,
-        # not a trading performance guarantee.
-        trim_n = max(1, int(len(returns) * 0.01)) if len(returns) >= 20 else 0
-        if trim_n:
-            without_top = returns.sort_values().iloc[:-trim_n]
-            avg_ex_top1 = without_top.mean()
-            top1_contribution = (
-                positive.nlargest(trim_n).sum() / positive.sum()
-                if positive.sum() > 0 else np.nan
-            )
-        else:
-            avg_ex_top1 = returns.mean()
-            top1_contribution = np.nan
-
-        std_return = returns.std(ddof=1) if len(returns) > 1 else np.nan
-        median = returns.median()
-
-        # Conservative research score: rewards positive median/mean,
-        # profit factor > 1 and win rate > 50%, while penalizing outlier
-        # dependence and very small samples. It is only for ranking candidates.
-        win_rate = (returns > 0).mean()
-        sample_factor = min(1.0, len(returns) / 1000.0)
-        pf_factor = min(1.5, max(0.0, profit_factor if np.isfinite(profit_factor) else 0.0)) / 1.5
-        edge_factor = min(1.0, max(0.0, (win_rate - 0.45) / 0.15))
-        median_factor = min(1.0, max(0.0, median / 0.02))
-        robust_mean_factor = min(1.0, max(0.0, avg_ex_top1 / 0.02))
-        outlier_penalty = (
-            min(1.0, max(0.0, top1_contribution - 0.50) / 0.50)
-            if np.isfinite(top1_contribution) else 0.0
-        )
-        robustness_score = 100 * sample_factor * (
-            0.30 * pf_factor
-            + 0.25 * edge_factor
-            + 0.20 * median_factor
-            + 0.25 * robust_mean_factor
-        ) * (1 - 0.50 * outlier_penalty)
-
-        rows.append({
-            "rule": label,
-            "horizon_days": horizon,
-            "signals": int(len(returns)),
-            "win_rate": float(win_rate),
-            "loss_rate": float((returns < 0).mean()),
-            "average_return": float(returns.mean()),
-            "median_return": float(median),
-            "p10_return": float(returns.quantile(0.10)),
-            "p25_return": float(returns.quantile(0.25)),
-            "p75_return": float(returns.quantile(0.75)),
-            "p90_return": float(returns.quantile(0.90)),
-            "best_return": float(returns.max()),
-            "worst_return": float(returns.min()),
-            "std_return": float(std_return) if np.isfinite(std_return) else None,
-            "average_ex_top_1pct": float(avg_ex_top1),
-            "top_1pct_profit_contribution": float(top1_contribution) if np.isfinite(top1_contribution) else None,
-            "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else None,
-            "robustness_score": float(robustness_score),
-        })
-
-    return rows
-
+def oos_top(f,ranked):
+    if ranked.empty: return pd.DataFrame()
+    z=f.copy(); z["i"]=z.groupby("symbol").cumcount(); z["n"]=z.groupby("symbol").symbol.transform("size")
+    z["oos"]=z.i>=z.n*.75
+    rows=[]
+    for _,r in ranked.head(50).iterrows():
+        names=[x.strip() for x in r.strategy.split(" + ") if x.strip() in CANDIDATES]
+        if not names or r.type=="cross_pool_agreement": continue
+        m=mask_for(z,names,int(r.threshold))&z.oos
+        s=evaluate(m,z,int(r.horizon))
+        if s: rows.append({"strategy":r.strategy,"horizon":int(r.horizon),"threshold":int(r.threshold),
+                           "oos_score":s["score"],"oos_signals":s["signals"],"oos_win_rate":s["win_rate"],
+                           "oos_average_return":s["average_return"],"oos_median_return":s["median_return"],
+                           "oos_profit_factor":s["profit_factor"]})
+    return pd.DataFrame(rows)
 
 def main():
-    df, files, failed = load_data()
-
-    features = build_features(df)
-
-    # --------------------------------
-    # Individual indicators
-    # --------------------------------
-    rules = {
-        "RSI < 30":
-            features["rsi_oversold"],
-
-        "RSI > 70":
-            features["rsi_overbought"],
-
-        "Close > EMA20":
-            features["above_ema20"],
-
-        "Close > EMA50":
-            features["above_ema50"],
-
-        "Volume >= 1.5x":
-            features["volume_1_5x"],
-
-        "Volume >= 2x":
-            features["volume_2x"],
-
-        "20D Breakout":
-            features["breakout20"],
-
-        "20D Breakdown":
-            features["breakdown20"],
-
-        "20D Momentum > 0":
-            features["momentum_positive"],
-
-        "20D Momentum > 5%":
-            features["momentum_5pct"],
-
-        "20D Momentum > 10%":
-            features["momentum_10pct"],
-
-        "ADX >= 25":
-            features["adx_strong"],
-
-        "Stochastic < 20":
-            features["stoch_oversold"],
-
-        "Near 20D Support":
-            features["near_support"],
-
-        "Near 20D Resistance":
-            features["near_resistance"],
-
-        "Near 50D Support":
-            features["near_support50"],
-
-        "Near 100D Support":
-            features["near_support100"],
-
-        "Near 50D Resistance":
-            features["near_resistance50"],
-
-        "Near 100D Resistance":
-            features["near_resistance100"],
-
-        "Higher Low":
-            features["higher_low"],
-
-        "Bottom Reclaim":
-            features["bottom_reclaim"],
-
-        "Support Rejection":
-            features["support_rejection"],
-
-        "Breakout Retest":
-            features["breakout_retest"],
-
-        "Resistance Rejection":
-            features["resistance_rejection"],
-
-        "Below Bollinger Lower":
-            features["below_bb_lower"],
-
-        "Bollinger Reclaim":
-            features["bb_reclaim"],
-
-        "Bullish Hammer":
-            features["hammer"],
-
-        "Bullish Engulfing":
-            features["bullish_engulfing"],
-
-        "Above Previous Pivot":
-            features["above_pivot"],
-
-        "Below Previous Pivot":
-            features["below_pivot"],
-    }
-
-    indicator_rows = []
-
-    for label, mask in rules.items():
-        indicator_rows.extend(
-            summarize(
-                mask,
-                features,
-                label
-            )
-        )
-
-    pd.DataFrame(
-        indicator_rows
-    ).to_csv(
-        RESULTS_DIR / "indicator_test.csv",
-        index=False
-    )
-
-    # --------------------------------
-    # Candidate strategy combinations
-    # --------------------------------
-    combinations = {
-        # Trend candidates
-        "Trend: EMA50 + Momentum":
-            features["above_ema50"] & features["momentum_positive"],
-        "Trend: EMA50 + Momentum + Volume":
-            features["above_ema50"] & features["momentum_positive"] & features["volume_1_5x"],
-        "Trend: EMA50 + ADX":
-            features["above_ema50"] & features["adx_strong"],
-
-        # Bottom / support candidates
-        "Reversal: 50D Support + RSI":
-            features["near_support50"] & features["rsi_oversold"],
-        "Reversal: 50D Support + Higher Low":
-            features["near_support50"] & features["higher_low"],
-        "Reversal: 50D Support + Volume":
-            features["near_support50"] & features["volume_1_5x"],
-        "Reversal: 50D Support + RSI + Higher Low":
-            features["near_support50"] & features["rsi_oversold"] & features["higher_low"],
-        "Reversal: 50D Support + Hammer":
-            features["near_support50"] & features["hammer"],
-        "Reversal: 50D Support + Bull Engulf":
-            features["near_support50"] & features["bullish_engulfing"],
-        "Reversal: Support Rejection + RSI":
-            features["support_rejection"] & features["rsi_oversold"],
-        "Reversal: Support Rejection + Volume":
-            features["support_rejection"] & features["volume_1_5x"],
-        "Reversal: 100D Support + RSI":
-            features["near_support100"] & features["rsi_oversold"],
-        "Reversal: Bottom Reclaim + Support":
-            features["bottom_reclaim"] & features["near_support50"],
-
-        # Existing useful reversal candidates retained for comparison
-        "Reversal: RSI + 20D Support":
-            features["rsi_oversold"] & features["near_support"],
-        "Reversal: RSI + Stoch + Support":
-            features["rsi_oversold"] & features["stoch_oversold"] & features["near_support"],
-        "Reversal: Hammer + Support":
-            features["hammer"] & features["near_support"],
-        "Reversal: Bull Engulf + Support":
-            features["bullish_engulfing"] & features["near_support"],
-
-        # Secondary breakdown trigger — not treated as the primary strategy
-        "Secondary: Breakdown + RSI":
-            features["breakdown20"] & features["rsi_oversold"],
-        "Secondary: Breakdown + RSI + Volume":
-            features["breakdown20"] & features["rsi_oversold"] & features["volume_1_5x"],
-        "Secondary: Breakdown + 50D Support":
-            features["breakdown20"] & features["near_support50"],
-
-        # Breakout / resistance candidates
-        "Breakout: Breakout + Volume":
-            features["breakout20"] & features["volume_1_5x"],
-        "Breakout: Breakout + EMA50 + Volume":
-            features["breakout20"] & features["above_ema50"] & features["volume_1_5x"],
-        "Breakout: Retest + Volume":
-            features["breakout_retest"] & features["volume_1_5x"],
-        "Resistance: Rejection + RSI":
-            features["resistance_rejection"] & features["rsi_overbought"],
-    }
-
-    combination_rows = []
-
-    for label, mask in combinations.items():
-        combination_rows.extend(
-            summarize(
-                mask,
-                features,
-                label
-            )
-        )
-
-    pd.DataFrame(
-        combination_rows
-    ).to_csv(
-        RESULTS_DIR / "strategy_tests.csv",
-        index=False
-    )
-
-    # --------------------------------
-    # Main research score
-    # --------------------------------
-    main_mask = (
-        features["main_score"] >= 4
-    )
-
-    baseline_rows = summarize(
-        main_mask,
-        features,
-        "Main score >= 4"
-    )
-
-    pd.DataFrame(
-        baseline_rows
-    ).to_csv(
-        RESULTS_DIR / "baseline_test.csv",
-        index=False
-    )
-
-    # --------------------------------
-    # Summary
-    # --------------------------------
-    summary = {
-        "engine":
-            "Nasdaq Backtest Engine V4 Research",
-
-        "generated_utc":
-            pd.Timestamp.now(
-                tz="UTC"
-            ).isoformat(),
-
-        "source_directory":
-            "daily-data/",
-
-        "source_files_read":
-            len(files),
-
-        "failed_files":
-            len(failed),
-
-        "records_after_cleaning":
-            int(len(df)),
-
-        "unique_symbols":
-            int(df["symbol"].nunique()),
-
-        "first_date":
-            str(df["date"].min().date()),
-
-        "last_date":
-            str(df["date"].max().date()),
-
-        "forward_horizons":
-            HORIZONS,
-
-        "entry_rule":
-            "Signal at T close; enter at T+1 open",
-
-        "exit_rule":
-            "Exit at T+horizon close",
-
-        "minimum_history_days":
-            MIN_HISTORY,
-
-        "features_included": [
-            "RSI 14",
-            "EMA 20",
-            "EMA 50",
-            "SMA 20",
-            "ATR 14",
-            "Volume Ratio 20",
-            "20D Support",
-            "20D Resistance",
-            "50D Support",
-            "50D Resistance",
-            "100D Support",
-            "100D Resistance",
-            "20D Breakout",
-            "20D Breakdown",
-            "5D Momentum",
-            "20D Momentum",
-            "Bollinger Bands",
-            "ADX 14",
-            "Stochastic",
-            "Previous-day Pivot",
-            "Pivot R1/R2",
-            "Pivot S1/S2",
-            "Hammer",
-            "Bullish Engulfing",
-            "Higher Low",
-            "Bottom Reclaim",
-            "Support Rejection",
-            "Breakout Retest",
-            "Resistance Rejection"
-        ],
-
-        "source_files_modified":
-            False,
-
-        "warning":
-            "Research statistics only. "
-            "No investment recommendation."
-    }
-
-    with (
-        RESULTS_DIR
-        / "summary.json"
-    ).open(
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            summary,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    print(
-        "Nasdaq Backtest Engine V4 Research completed."
-    )
-
-    print(
-        f"Rows: {len(df):,}"
-    )
-
-    print(
-        f"Symbols: {df['symbol'].nunique():,}"
-    )
-
-    print(
-        "Results written to results/."
-    )
-
-
-if __name__ == "__main__":
+    df,failed=load_data(); f=build_features(df)
+    base=base_tests(f); winners=select_winners(base)
+    frames=[combo_tests(f,winners[h],h) for h in HORIZONS if winners[h]]
+    combo=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    cross=cross_pool(f,winners[10],winners[20])
+    ranked=combo.sort_values(["score","average_return","win_rate"],ascending=False).reset_index(drop=True) if not combo.empty else combo
+    if not ranked.empty: ranked.insert(0,"rank",np.arange(1,len(ranked)+1))
+    oos=oos_top(f,ranked)
+    base.to_csv(RESULTS_DIR/"base_strategy_tests.csv",index=False)
+    combo.to_csv(RESULTS_DIR/"combo_tests.csv",index=False)
+    cross.to_csv(RESULTS_DIR/"cross_pool_tests.csv",index=False)
+    oos.to_csv(RESULTS_DIR/"oos_top50.csv",index=False)
+    summary={"engine":"Nasdaq Combo Engine V1","method":"formula_consensus",
+             "horizons":HORIZONS,"entry_rule":"T close signal -> T+1 open",
+             "exit_rule":"T+horizon close","winner_pool_10d":winners[10],"winner_pool_20d":winners[20],
+             "records":len(df),"symbols":int(df.symbol.nunique()),
+             "first_date":str(df.date.min().date()),"last_date":str(df.date.max().date()),
+             "failed_files":len(failed),
+             "top_10d":ranked[ranked.horizon==10].head(20).to_dict("records") if not ranked.empty else [],
+             "top_20d":ranked[ranked.horizon==20].head(20).to_dict("records") if not ranked.empty else [],
+             "top_oos":oos.head(20).to_dict("records") if not oos.empty else [],
+             "warning":"Score 89 is a research ranking target, not an 89% probability of profit."}
+    (RESULTS_DIR/"combo_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
+    print("NASDAQ COMBO ENGINE V1 COMPLETE")
+    print("10D WINNERS:", winners[10])
+    print("20D WINNERS:", winners[20])
+    print("Results:", RESULTS_DIR)
+
+if __name__=="__main__":
     main()
