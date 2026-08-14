@@ -1,0 +1,9 @@
+{
+  "standalone_tests_not_run": true,
+  "baseline_scores_are_previous_results": {
+    "A_50D_SUPPORT_BULL_ENGULF": 71.89,
+    "B_50D_SUPPORT_HIGHER_LOW": 68.02,
+    "C_BREAKDOWN_50D_SUPPORT": 64.48
+  },
+  "best_previous_score": 71.89
+}
