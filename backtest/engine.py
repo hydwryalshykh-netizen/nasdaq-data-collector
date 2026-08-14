@@ -1,7 +1,3 @@
-# Nasdaq Combo Engine V1
-# Pure formula backtest: separates 10-day and 20-day winners,
-# combines them with OR / consensus voting, then performs OOS checking.
-
 import json
 from itertools import combinations
 from pathlib import Path
