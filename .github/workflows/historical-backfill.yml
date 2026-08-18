@@ -2,35 +2,62 @@ name: جمع بيانات NASDAQ التاريخية
 
 on:
   workflow_dispatch:
+    inputs:
+
+      from_date:
+        description: "تاريخ البداية - شامل"
+        required: true
+        default: "2025-01-01"
+
+      to_date:
+        description: "تاريخ النهاية - غير شامل"
+        required: true
+        default: "2026-01-01"
+
 
 jobs:
+
   collect-historical-data:
+
     runs-on: ubuntu-latest
 
+    timeout-minutes: 360
+
     steps:
+
       - name: تحميل المستودع
         uses: actions/checkout@v4
 
-      - name: إعداد بايثون
+      - name: إعداد Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: تثبيت المكتبات المطلوبة
-        run: pip install requests
+      - name: تثبيت المكتبات
+        run: |
+          pip install requests
 
-      - name: جلب البيانات التاريخية من Polygon / Massive
+      - name: جلب البيانات التاريخية
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-        run: python scripts/fetch-massive-historical.py
 
-      - name: حفظ البيانات التاريخية
+          BACKFILL_FROM: ${{ inputs.from_date }}
+          BACKFILL_TO: ${{ inputs.to_date }}
+
         run: |
+          python scripts/fetch-massive-historical.py
+
+      - name: حفظ البيانات
+        run: |
+
           git config user.name "GitHub Actions Bot"
+
           git config user.email "actions@github.com"
 
           git add daily-data/
 
-          git commit -m "إضافة بيانات NASDAQ التاريخية 2026" || echo "لا توجد تغييرات جديدة"
+          git commit \
+            -m "إضافة بيانات NASDAQ التاريخية من ${{ inputs.from_date }} إلى ${{ inputs.to_date }}" \
+            || echo "لا توجد تغييرات جديدة"
 
           git push
