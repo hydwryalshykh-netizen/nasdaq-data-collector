@@ -14,6 +14,7 @@
      (تحديث نفس الرسالة بدل إرسال رسالة جديدة).
 """
 
+import gzip
 import json
 import os
 import sys
@@ -25,7 +26,11 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parent
 DAILY_DATA_DIR = REPO_ROOT / "daily-data"
 MERGED_FILE = REPO_ROOT / "merged-data.json"
+MERGED_FILE_GZ = REPO_ROOT / "merged-data.json.gz"
 MESSAGE_ID_FILE = REPO_ROOT / "telegram-message-id.txt"
+
+# حد أمان تحت الحد الرسمي لتلغرام (50 ميجا) عشان نتجنب مشاكل الشبكة/الوسيط
+TELEGRAM_MAX_BYTES = 45 * 1024 * 1024
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -71,11 +76,25 @@ def load_previous_merged() -> dict | None:
 
 
 def save_merged(merged: dict) -> None:
-    """يحفظ الملف المدموج مرتبًا حسب التاريخ."""
+    """
+    يحفظ الملف المدموج مرتبًا حسب التاريخ.
+    نستخدم صيغة compact (بدون indent) لتقليل حجم الملف على GitHub وتلغرام.
+    """
     sorted_merged = dict(sorted(merged.items()))
     with open(MERGED_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted_merged, f, ensure_ascii=False, indent=2)
-    print(f"💾 تم حفظ {MERGED_FILE.name} ({len(sorted_merged)} يوم)")
+        json.dump(sorted_merged, f, ensure_ascii=False, separators=(",", ":"))
+    size_mb = MERGED_FILE.stat().st_size / (1024 * 1024)
+    print(f"💾 تم حفظ {MERGED_FILE.name} ({len(sorted_merged)} يوم, {size_mb:.2f} MB)")
+
+
+def compress_merged() -> Path:
+    """يضغط merged-data.json إلى merged-data.json.gz ويرجع مسار الملف المضغوط."""
+    with open(MERGED_FILE, "rb") as f_in:
+        with gzip.open(MERGED_FILE_GZ, "wb", compresslevel=9) as f_out:
+            f_out.writelines(f_in)
+    size_mb = MERGED_FILE_GZ.stat().st_size / (1024 * 1024)
+    print(f"🗜️  تم ضغط الملف إلى {MERGED_FILE_GZ.name} ({size_mb:.2f} MB)")
+    return MERGED_FILE_GZ
 
 
 def get_new_dates(old: dict | None, new: dict) -> list[str]:
@@ -99,18 +118,32 @@ def save_message_id(message_id: int) -> None:
     MESSAGE_ID_FILE.write_text(str(message_id), encoding="utf-8")
 
 
+def check_size_or_exit(file_path: Path) -> None:
+    size = file_path.stat().st_size
+    if size > TELEGRAM_MAX_BYTES:
+        size_mb = size / (1024 * 1024)
+        print(
+            f"❌ الملف {file_path.name} حجمه {size_mb:.1f} MB حتى بعد الضغط، "
+            "وهذا أكبر من حد تلغرام الآمن (45 MB). "
+            "الحل: قسّم البيانات لملفات متعددة (مثلاً كل سنة ملف مستقل) بدل ملف واحد ضخم.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def send_new_file_to_telegram(file_path: Path) -> int:
     """يرسل الملف كرسالة جديدة ويرجع message_id."""
+    check_size_or_exit(file_path)
     url = f"{TELEGRAM_API}/sendDocument"
     with open(file_path, "rb") as f:
         resp = requests.post(
             url,
             data={
                 "chat_id": CHAT_ID,
-                "caption": "📊 بيانات NASDAQ المجمّعة (تحديث تلقائي يومي)",
+                "caption": "📊 بيانات NASDAQ المجمّعة (تحديث تلقائي يومي) - مضغوط gzip",
             },
-            files={"document": (file_path.name, f, "application/json")},
-            timeout=60,
+            files={"document": (file_path.name, f, "application/gzip")},
+            timeout=120,
         )
     resp.raise_for_status()
     result = resp.json()
@@ -127,11 +160,12 @@ def update_existing_message(file_path: Path, message_id: int) -> bool:
     يحاول تحديث نفس الرسالة القديمة بالملف الجديد.
     يرجع True لو نجح، False لو فشل (مثلاً الرسالة انحذفت أو قديمة جدًا).
     """
+    check_size_or_exit(file_path)
     url = f"{TELEGRAM_API}/editMessageMedia"
     media = {
         "type": "document",
         "media": "attach://document",
-        "caption": "📊 بيانات NASDAQ المجمّعة (آخر تحديث يومي)",
+        "caption": "📊 بيانات NASDAQ المجمّعة (آخر تحديث يومي) - مضغوط gzip",
     }
     with open(file_path, "rb") as f:
         resp = requests.post(
@@ -141,8 +175,8 @@ def update_existing_message(file_path: Path, message_id: int) -> bool:
                 "message_id": message_id,
                 "media": json.dumps(media),
             },
-            files={"document": (file_path.name, f, "application/json")},
-            timeout=60,
+            files={"document": (file_path.name, f, "application/gzip")},
+            timeout=120,
         )
     result = resp.json()
     if result.get("ok"):
@@ -174,19 +208,20 @@ def main() -> None:
         print("ℹ️  لا يوجد تاريخ جديد اليوم، لن يتم إرسال شيء لتلغرام.")
         return
 
+    gz_file = compress_merged()
     message_id = get_saved_message_id()
 
     if message_id is None:
         # أول مرة نرسل فيها
-        new_id = send_new_file_to_telegram(MERGED_FILE)
+        new_id = send_new_file_to_telegram(gz_file)
         save_message_id(new_id)
     else:
         # نحاول نحدث نفس الرسالة
-        success = update_existing_message(MERGED_FILE, message_id)
+        success = update_existing_message(gz_file, message_id)
         if not success:
             # لو فشل (مثلاً الرسالة انحذفت يدويًا)، نرسل رسالة جديدة ونحدث الـ id
             print("↪️  إرسال رسالة جديدة بدل التحديث الفاشل...")
-            new_id = send_new_file_to_telegram(MERGED_FILE)
+            new_id = send_new_file_to_telegram(gz_file)
             save_message_id(new_id)
 
     if new_dates:
