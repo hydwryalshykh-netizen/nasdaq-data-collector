@@ -1,0 +1,39 @@
+name: Telegram Daily Sync
+
+on:
+  schedule:
+    # يشتغل يوميًا الساعة 21:00 UTC (تقدر تغيّرها لأي وقت يناسبك)
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}  # يسمح لك بتشغيله يدويًا من تبويب Actions
+
+permissions:
+  contents: write  # يحتاجها عشان يقدر يعمل commit للملف المدموج
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run sync script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python sync_to_telegram.py
+
+      - name: Commit updated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add merged-data.json telegram-message-id.txt
+          git diff --staged --quiet || git commit -m "تحديث تلقائي: دمج بيانات NASDAQ وإرسالها لتلغرام"
+          git push
