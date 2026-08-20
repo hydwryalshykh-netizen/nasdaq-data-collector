@@ -1,13 +1,13 @@
-name: Telegram Daily Sync
+name: Telegram Yearly Archive Sync
 
 on:
   schedule:
-    # يشتغل يوميًا الساعة 21:00 UTC (تقدر تغيّرها لأي وقت يناسبك)
-    - cron: "0 21 * * *"
-  workflow_dispatch: {}  # يسمح لك بتشغيله يدويًا من تبويب Actions
+    # يشتغل يومياً الساعة 21:30 UTC (بعد workflow جلب البيانات اليومية)
+    - cron: "30 21 * * *"
+  workflow_dispatch: {}   # تشغيل يدوي من تبويب Actions
 
 permissions:
-  contents: write  # يحتاجها عشان يقدر يعمل commit للملف المدموج
+  contents: write
 
 jobs:
   sync:
@@ -24,16 +24,16 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run sync script
+      - name: Run archive sync
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python sync_to_telegram.py
 
-      - name: Commit updated files
+      - name: Commit tracking files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add merged-data.json telegram-message-id.txt
-          git diff --staged --quiet || git commit -m "تحديث تلقائي: دمج بيانات NASDAQ وإرسالها لتلغرام"
+          git add telegram-ids.json telegram-hashes.json
+          git diff --staged --quiet || git commit -m "تحديث تلقائي: أرشيف NASDAQ السنوي"
           git push
