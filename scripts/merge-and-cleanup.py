@@ -3,15 +3,27 @@ merge-and-cleanup.py
 ======================
 الوظيفة: يدمج بيانات NASDAQ مع بيانات OHLC من Finnhub بسجل JSON واحد موحّد لكل سهم.
 
-ملاحظة مهمة حول التاريخ:
--------------------------
-لا نعتمد على datetime.now() لتحديد "تاريخ اليوم"، لأن GitHub Actions runner يعمل
-بتوقيت UTC، بينما بيانات Finnhub تعكس آخر إغلاق فعلي لسوق NASDAQ (توقيت نيويورك).
-الفرق بين التوقيتين (4-5 ساعات) كان يسبب أحياناً تسجيل بيانات يوم معين تحت تاريخ
-اليوم التالي (أو العكس)، مما أدى لتكرار/فقدان أيام في الأرشيف.
+===============================================================================
+ملاحظة مهمة جداً حول طريقة حساب التاريخ (بعد حادثة تداخل بيانات 27/28 أغسطس 2026):
+===============================================================================
+كانت النسخة السابقة من هذا الملف تحسب "تاريخ التداول" بالاعتماد على أقصى قيمة
+timestamp راجعة من Finnhub بين كل الأسهم (get_market_date القديمة). هذا الأسلوب
+كان يبدو منطقياً، لكنه تسبب فعلياً بخلط بيانات يومين مختلفين ببعض:
 
-الحل: نشتق "تاريخ التداول" من حقل timestamp الحقيقي الراجع من Finnhub لكل سهم
-(محوّلاً لتوقيت America/New_York)، وليس من ساعة تشغيل السكربت.
+  - بعض رموز الأسهم (خصوصاً قليلة السيولة) ترجع من Finnhub بقيمة timestamp
+    غير متسقة مع بقية السوق (أحياناً متأخرة، ونادراً متقدمة بشكل غير متوقع).
+  - الاعتماد على max() بين آلاف القيم يجعل قيمة شاذة واحدة (outlier) من سهم
+    واحد كافية لإفساد "تاريخ اليوم" للملف بأكمله.
+  - النتيجة الفعلية: تشغيل يوم الخميس 27/8 حسب تاريخاً خاطئاً (28/8) وكتب
+    الملف باسم غلط، ثم تشغيل الجمعة 28/8 "صحّح" التسمية بطريقة خاطئة أدت
+    لضياع بيانات الخميس الحقيقية بالكامل تحت اسم يوم آخر.
+
+الحل المعتمد الآن: نحسب "تاريخ التداول" بأنفسنا من وقت تشغيل السكربت نفسه
+(وقت التشغيل الفعلي في UTC، محوّلاً لتوقيت أمريكا/نيويورك)، وليس من بيانات
+API خارجية غير متجانسة. نتحقق أيضاً أن هذا اليوم فعلاً يوم تداول (وليس
+سبت/أحد أو عطلة رسمية معروفة)، ونرفض التنفيذ بوضوح بدل الكتابة فوق ملف
+بتاريخ خاطئ إن لم يكن كذلك.
+===============================================================================
 """
 
 import json
@@ -29,6 +41,24 @@ RETENTION_DAYS = 365
 
 NY_TZ = ZoneInfo("America/New_York")
 
+# عطلات NASDAQ الرسمية لعام 2026 (بالإضافة لأيام السبت والأحد، التي تُستبعد
+# تلقائياً). التحقق من هذه القائمة يمنع تشغيل السكربت بالخطأ في يوم لا يوجد
+# فيه تداول فعلي، وبالتالي يمنع تسجيل بيانات إغلاق سابقة تحت تاريخ خاطئ.
+# المصدر: NYSE/NASDAQ Holiday Calendar 2026 (تم التحقق: أغسطس 2026).
+# يُرجى تحديث هذه القائمة في بداية كل سنة جديدة.
+NASDAQ_HOLIDAYS_2026 = {
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # Martin Luther King Jr. Day
+    "2026-02-16",  # Presidents' Day
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-06-19",  # Juneteenth
+    "2026-07-03",  # Independence Day (observed)
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving Day
+    "2026-12-25",  # Christmas Day
+}
+
 
 def load_json_file(filepath):
     if not os.path.exists(filepath):
@@ -38,29 +68,33 @@ def load_json_file(filepath):
         return json.load(f)
 
 
-def get_market_date(ohlc_data):
+def get_market_date():
     """
-    يحدد تاريخ التداول الفعلي بالاعتماد على أحدث timestamp حقيقي من Finnhub
-    بين كل الأسهم، محوّلاً لتوقيت نيويورك (توقيت سوق NASDAQ).
+    يحدد تاريخ التداول بالاعتماد على وقت تشغيل السكربت الفعلي، محوّلاً لتوقيت
+    نيويورك (توقيت سوق NASDAQ). هذا أسلوب موثوق وثابت، بعكس الاعتماد على
+    timestamp قادم من بيانات Finnhub لكل سهم على حدة (انظر الشرح أعلى الملف).
 
-    هذا يضمن أن السجل يُحفظ دائماً تحت تاريخ يوم التداول الصحيح، بغض النظر
-    عن توقيت تشغيل GitHub Actions (UTC).
+    يرفض (raise) إن كان اليوم الحالي بتوقيت نيويورك ليس يوم تداول (سبت/أحد
+    أو عطلة رسمية)، بدل أن يكتب بصمت بيانات قديمة تحت تاريخ خاطئ.
     """
-    timestamps = [
-        entry["timestamp"]
-        for entry in ohlc_data.values()
-        if entry and entry.get("timestamp")
-    ]
+    now_ny = datetime.now(NY_TZ)
+    date_str = now_ny.strftime("%Y-%m-%d")
+    weekday = now_ny.weekday()  # الاثنين=0 ... الأحد=6
 
-    if not timestamps:
-        # احتياطي فقط في حال عدم توفر أي timestamp صالح من Finnhub على الإطلاق
-        print("تحذير: لا توجد أي timestamps صالحة من Finnhub، سيُستخدم وقت التشغيل كبديل.")
-        return datetime.now(NY_TZ).strftime("%Y-%m-%d")
+    if weekday >= 5:
+        raise RuntimeError(
+            f"تاريخ اليوم {date_str} بتوقيت نيويورك هو عطلة أسبوعية "
+            f"(يوم {'السبت' if weekday == 5 else 'الأحد'}). لا يوجد تداول، "
+            f"لن يُكتب أي ملف لتجنب تسجيل بيانات قديمة بتاريخ خاطئ."
+        )
 
-    # نأخذ أحدث timestamp (وليس أول واحد) لأنه الأقرب لحظة إغلاق السوق الفعلية
-    latest_ts = max(timestamps)
-    market_time = datetime.fromtimestamp(latest_ts, tz=NY_TZ)
-    return market_time.strftime("%Y-%m-%d")
+    if date_str in NASDAQ_HOLIDAYS_2026:
+        raise RuntimeError(
+            f"تاريخ اليوم {date_str} هو عطلة NASDAQ رسمية معروفة. لا يوجد "
+            f"تداول، لن يُكتب أي ملف لتجنب تسجيل بيانات قديمة بتاريخ خاطئ."
+        )
+
+    return date_str
 
 
 def merge_data(symbols_data, ohlc_data, market_date):
@@ -93,6 +127,23 @@ def save_daily_file(merged_records, market_date):
     os.makedirs(DAILY_DATA_DIR, exist_ok=True)
 
     filepath = os.path.join(DAILY_DATA_DIR, f"{market_date}.json")
+
+    # حماية إضافية: إن وُجد ملف بنفس التاريخ مسبقاً وعدد سجلاته مختلف بشكل
+    # كبير عن الملف الجديد (مؤشر محتمل على بيانات يومين مختلفين تحت نفس
+    # الاسم)، نطبع تحذيراً واضحاً بدل الاستبدال الصامت.
+    if os.path.exists(filepath):
+        try:
+            existing = load_json_file(filepath)
+            existing_count = existing.get("total_records", 0)
+            new_count = len(merged_records)
+            if existing_count and abs(existing_count - new_count) > (existing_count * 0.05):
+                print(
+                    f"تحذير: الملف {filepath} موجود مسبقاً بعدد سجلات مختلف "
+                    f"بشكل ملحوظ (قديم: {existing_count}, جديد: {new_count}). "
+                    f"سيتم الاستبدال، لكن يُنصح بمراجعة السبب يدوياً."
+                )
+        except (json.JSONDecodeError, KeyError):
+            pass
 
     output = {
         "date": market_date,
@@ -146,11 +197,13 @@ def cleanup_old_files():
 def main():
     print("بدء عملية الدمج والتنظيف...")
 
+    # يُحسب أولاً ويُتحقق منه قبل أي عملية جلب أو دمج، حتى نفشل بوضوح ومبكراً
+    # إن كان اليوم ليس يوم تداول، بدل هدر وقت التشغيل ثم كتابة بيانات خاطئة.
+    market_date = get_market_date()
+    print(f"تاريخ التداول المُحدد (بتوقيت نيويورك): {market_date}")
+
     symbols_data = load_json_file(SYMBOLS_FILE)["symbols"]
     ohlc_data = load_json_file(OHLC_FILE)["ohlc_data"]
-
-    market_date = get_market_date(ohlc_data)
-    print(f"تاريخ التداول المُحدد من بيانات Finnhub: {market_date}")
 
     merged_records = merge_data(symbols_data, ohlc_data, market_date)
 
