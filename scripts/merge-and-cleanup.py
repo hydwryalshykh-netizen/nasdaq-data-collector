@@ -2,12 +2,23 @@
 merge-and-cleanup.py
 ======================
 الوظيفة: يدمج بيانات NASDAQ مع بيانات OHLC من Finnhub بسجل JSON واحد موحّد لكل سهم.
+
+ملاحظة مهمة حول التاريخ:
+-------------------------
+لا نعتمد على datetime.now() لتحديد "تاريخ اليوم"، لأن GitHub Actions runner يعمل
+بتوقيت UTC، بينما بيانات Finnhub تعكس آخر إغلاق فعلي لسوق NASDAQ (توقيت نيويورك).
+الفرق بين التوقيتين (4-5 ساعات) كان يسبب أحياناً تسجيل بيانات يوم معين تحت تاريخ
+اليوم التالي (أو العكس)، مما أدى لتكرار/فقدان أيام في الأرشيف.
+
+الحل: نشتق "تاريخ التداول" من حقل timestamp الحقيقي الراجع من Finnhub لكل سهم
+(محوّلاً لتوقيت America/New_York)، وليس من ساعة تشغيل السكربت.
 """
 
 import json
 import os
 import glob
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 SYMBOLS_FILE = "symbols-reference.json"
 OHLC_FILE = "ohlc-data-today.json"
@@ -15,6 +26,8 @@ DAILY_DATA_DIR = "daily-data"
 LATEST_FILE = "latest.json"
 
 RETENTION_DAYS = 365
+
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def load_json_file(filepath):
@@ -25,8 +38,32 @@ def load_json_file(filepath):
         return json.load(f)
 
 
-def merge_data(symbols_data, ohlc_data):
-    today = datetime.now().strftime("%Y-%m-%d")
+def get_market_date(ohlc_data):
+    """
+    يحدد تاريخ التداول الفعلي بالاعتماد على أحدث timestamp حقيقي من Finnhub
+    بين كل الأسهم، محوّلاً لتوقيت نيويورك (توقيت سوق NASDAQ).
+
+    هذا يضمن أن السجل يُحفظ دائماً تحت تاريخ يوم التداول الصحيح، بغض النظر
+    عن توقيت تشغيل GitHub Actions (UTC).
+    """
+    timestamps = [
+        entry["timestamp"]
+        for entry in ohlc_data.values()
+        if entry and entry.get("timestamp")
+    ]
+
+    if not timestamps:
+        # احتياطي فقط في حال عدم توفر أي timestamp صالح من Finnhub على الإطلاق
+        print("تحذير: لا توجد أي timestamps صالحة من Finnhub، سيُستخدم وقت التشغيل كبديل.")
+        return datetime.now(NY_TZ).strftime("%Y-%m-%d")
+
+    # نأخذ أحدث timestamp (وليس أول واحد) لأنه الأقرب لحظة إغلاق السوق الفعلية
+    latest_ts = max(timestamps)
+    market_time = datetime.fromtimestamp(latest_ts, tz=NY_TZ)
+    return market_time.strftime("%Y-%m-%d")
+
+
+def merge_data(symbols_data, ohlc_data, market_date):
     merged_records = []
 
     for symbol_entry in symbols_data:
@@ -35,7 +72,7 @@ def merge_data(symbols_data, ohlc_data):
 
         record = {
             "symbol": symbol,
-            "date": today,
+            "date": market_date,
             "open": ohlc["open"] if ohlc else None,
             "high": ohlc["high"] if ohlc else None,
             "low": ohlc["low"] if ohlc else None,
@@ -52,15 +89,14 @@ def merge_data(symbols_data, ohlc_data):
     return merged_records
 
 
-def save_daily_file(merged_records):
+def save_daily_file(merged_records, market_date):
     os.makedirs(DAILY_DATA_DIR, exist_ok=True)
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    filepath = os.path.join(DAILY_DATA_DIR, f"{today}.json")
+    filepath = os.path.join(DAILY_DATA_DIR, f"{market_date}.json")
 
     output = {
-        "date": today,
-        "generated_at": datetime.now().isoformat(),
+        "date": market_date,
+        "generated_at": datetime.now(NY_TZ).isoformat(),
         "total_records": len(merged_records),
         "records": merged_records,
     }
@@ -84,7 +120,7 @@ def cleanup_old_files():
     if not os.path.exists(DAILY_DATA_DIR):
         return
 
-    cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+    cutoff_date = datetime.now(NY_TZ).replace(tzinfo=None) - timedelta(days=RETENTION_DAYS)
     deleted_count = 0
 
     for filepath in glob.glob(os.path.join(DAILY_DATA_DIR, "*.json")):
@@ -113,9 +149,12 @@ def main():
     symbols_data = load_json_file(SYMBOLS_FILE)["symbols"]
     ohlc_data = load_json_file(OHLC_FILE)["ohlc_data"]
 
-    merged_records = merge_data(symbols_data, ohlc_data)
+    market_date = get_market_date(ohlc_data)
+    print(f"تاريخ التداول المُحدد من بيانات Finnhub: {market_date}")
 
-    daily_output = save_daily_file(merged_records)
+    merged_records = merge_data(symbols_data, ohlc_data, market_date)
+
+    daily_output = save_daily_file(merged_records, market_date)
     update_latest_file(daily_output)
 
     cleanup_old_files()
