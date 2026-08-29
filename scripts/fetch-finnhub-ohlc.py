@@ -65,8 +65,9 @@ def fetch_ohlc_for_symbol(symbol):
             "low": data.get("l"),
             "close": data.get("c"),
             "previous_close": data.get("pc"),
-            # 't' من Finnhub هو timestamp حقيقي (UTC epoch seconds) لوقت آخر تحديث سعر.
-            # هذا هو المصدر الوحيد الموثوق لتحديد "يوم التداول" الفعلي لاحقاً.
+            # 't' من Finnhub يُحفظ للمرجعية فقط (تشخيص/تدقيق). لا يُستخدم بعد الآن
+            # لحساب "تاريخ اليوم" لأنه غير متجانس عبر آلاف الرموز (انظر
+            # merge-and-cleanup.py لتفاصيل سبب التحول عن هذا الأسلوب).
             "timestamp": data.get("t"),
         }
 
