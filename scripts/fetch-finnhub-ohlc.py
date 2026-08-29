@@ -9,6 +9,7 @@ import json
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
@@ -17,6 +18,10 @@ SYMBOLS_FILE = "symbols-reference.json"
 OUTPUT_FILE = "ohlc-data-today.json"
 
 DELAY_BETWEEN_REQUESTS_SECONDS = 1.05
+
+# كل حسابات التاريخ/الوقت في هذا المشروع تُبنى على توقيت نيويورك
+# (توقيت سوق NASDAQ الفعلي)، وليس توقيت الجهاز المُشغّل (UTC على GitHub Actions).
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def load_symbols():
@@ -60,6 +65,8 @@ def fetch_ohlc_for_symbol(symbol):
             "low": data.get("l"),
             "close": data.get("c"),
             "previous_close": data.get("pc"),
+            # 't' من Finnhub هو timestamp حقيقي (UTC epoch seconds) لوقت آخر تحديث سعر.
+            # هذا هو المصدر الوحيد الموثوق لتحديد "يوم التداول" الفعلي لاحقاً.
             "timestamp": data.get("t"),
         }
 
@@ -74,7 +81,7 @@ def main():
 
     symbols_data = load_symbols()
     total = len(symbols_data)
-    print(f"[{datetime.now().isoformat()}] بدء جلب بيانات OHLC لـ {total} سهماً...")
+    print(f"[{datetime.now(NY_TZ).isoformat()}] بدء جلب بيانات OHLC لـ {total} سهماً...")
 
     results = {}
     success_count = 0
@@ -92,7 +99,7 @@ def main():
 
         if index % 100 == 0:
             print(
-                f"[{datetime.now().isoformat()}] "
+                f"[{datetime.now(NY_TZ).isoformat()}] "
                 f"التقدم: {index}/{total} (نجح: {success_count}, فشل: {fail_count})"
             )
 
@@ -103,7 +110,7 @@ def main():
         raise RuntimeError(f"نسبة فشل عالية جداً ({failure_rate:.0%}). لن يُحفظ الملف.")
 
     output = {
-        "fetched_at": datetime.now().isoformat(),
+        "fetched_at": datetime.now(NY_TZ).isoformat(),
         "total_requested": total,
         "total_success": success_count,
         "total_failed": fail_count,
@@ -114,7 +121,7 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(
-        f"[{datetime.now().isoformat()}] اكتمل الجلب. "
+        f"[{datetime.now(NY_TZ).isoformat()}] اكتمل الجلب. "
         f"نجح: {success_count}/{total} — تم الحفظ بملف {OUTPUT_FILE}"
     )
 
