@@ -1,58 +1,66 @@
-name: جمع بيانات NASDAQ اليومية
+name: جمع بيانات NASDAQ + NYSE اليومية
 
 on:
   schedule:
-    # ==========================================================================
-    # ملاحظة حول التوقيت:
-    # الجدولة هنا ثابتة بمعيار UTC طوال السنة (لا تتغير أبداً، ولا حاجة لأي
-    # شرط أو منطق إضافي للتوقيت الصيفي/الشتوي). التشغيل الثابت بالساعة 22:00 UTC
-    # يعطي تلقائياً:
-    #
-    #   - أثناء EDT (التوقيت الصيفي لنيويورك، UTC-4): إغلاق السوق 4:00 مساءً
-    #     محلياً = 20:00 UTC، فالتشغيل الساعة 22:00 UTC يكون بعد الإغلاق
-    #     بساعتين بالضبط.
-    #
-    #   - أثناء EST (التوقيت الشتوي لنيويورك، UTC-5): إغلاق السوق 4:00 مساءً
-    #     محلياً = 21:00 UTC، فنفس التشغيل الساعة 22:00 UTC يكون بعد الإغلاق
-    #     بساعة واحدة بالضبط.
-    #
-    # هذا الفرق (ساعتين صيفاً / ساعة شتاءً) هو المطلوب بالضبط، وينتج تلقائياً
-    # من ثبات رقم الـ cron بمعيار UTC — بدون أي حاجة لتعديل الجدولة موسمياً.
-    # ==========================================================================
-    - cron: '0 22 * * 1-5'   # ثابتة طوال السنة: بعد الإغلاق بساعتين صيفاً / ساعة شتاءً
-  workflow_dispatch:          # يسمح بالتشغيل اليدوي أيضاً عند الحاجة للاختبار
+    - cron: '0 22 * * 1-5'
+
+  workflow_dispatch:
 
 jobs:
   collect-data:
     runs-on: ubuntu-latest
 
     steps:
-      - name: تحميل المستودع
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: إعداد بايثون
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: تثبيت المكتبات المطلوبة
-        run: pip install requests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: جلب قائمة رموز NASDAQ الحالية (يتضمن أي شركة جديدة/محذوفة تلقائياً)
-        run: python scripts/fetch-nasdaq-symbols.py
+      # =========================================================
+      # إنشاء قائمة NASDAQ + NYSE
+      # =========================================================
+      - name: Fetch NASDAQ + NYSE symbols
+        run: |
+          python scripts/fetch-us-symbols.py
 
-      - name: جلب بيانات OHLC الكاملة من Finnhub لكل الرموز
+      # =========================================================
+      # جلب OHLCV لجميع الرموز
+      # =========================================================
+      - name: Fetch daily OHLC
+        run: |
+          python scripts/fetch-finnhub-ohlc.py
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        run: python scripts/fetch-finnhub-ohlc.py
 
-      - name: دمج البيانات وتحديث الأرشيف وتنظيف الملفات القديمة
-        run: python scripts/merge-and-cleanup.py
-
-      - name: حفظ التحديثات بالمستودع
+      # =========================================================
+      # دمج البيانات وحفظ اليوم الحالي
+      # =========================================================
+      - name: Merge and cleanup
         run: |
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions@github.com"
-          git add daily-data/ latest.json symbols-reference.json
-          git commit -m "تحديث بيانات $(date +'%Y-%m-%d')" || echo "لا توجد تغييرات جديدة لحفظها"
+          python scripts/merge-and-cleanup.py
+
+      # =========================================================
+      # حفظ التغييرات
+      # =========================================================
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            daily-data/ \
+            latest.json \
+            symbols-reference.json
+
+          git diff --cached --quiet || \
+            git commit -m "تحديث بيانات NASDAQ و NYSE اليومية"
+
           git push
