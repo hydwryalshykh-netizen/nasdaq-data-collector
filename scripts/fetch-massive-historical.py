@@ -1,480 +1,499 @@
 import json
 import os
-import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 import requests
 
+API_URL = "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks"
 
-MASSIVE_URL = (
-    "https://api.massive.com/v2/aggs/grouped/"
-    "locale/us/market/stocks"
-)
-
-API_KEY = os.getenv("MASSIVE_API_KEY")
+API_KEY = os.environ.get("MASSIVE_API_KEY")
 
 SYMBOLS_FILE = "symbols-reference.json"
-DAILY_DIR = "daily-data"
+DAILY_DATA_DIR = "daily-data"
 
-BACKFILL_FROM = os.getenv(
-    "BACKFILL_FROM",
-    "2025-01-01",
+============================================================
+
+نطاق التشغيل يأتي من GitHub Actions
+
+
+
+مثال التشغيل الأول:
+
+BACKFILL_FROM = 2025-01-01
+
+BACKFILL_TO   = 2026-01-01
+
+
+
+الـ TO غير شامل.
+
+أي أن التشغيل الأول يجلب:
+
+2025-01-01 → 2025-12-31
+
+============================================================
+
+BACKFILL_FROM = os.environ.get(
+"BACKFILL_FROM",
+"2025-01-01"
 )
 
-BACKFILL_TO = os.getenv(
-    "BACKFILL_TO",
-    "2026-10-01",
+BACKFILL_TO = os.environ.get(
+"BACKFILL_TO",
+"2026-01-01"
 )
+
+الحد المجاني المفترض:
+
+5 طلبات / دقيقة
+
+12.5 ثانية ≈ 4.8 طلب / دقيقة
 
 REQUEST_DELAY = 12.5
 
+def parse_date(value, variable_name):
+
+try:  
+    return date.fromisoformat(value)  
+
+except ValueError:  
+    raise RuntimeError(  
+        f"{variable_name} يجب أن يكون بصيغة YYYY-MM-DD. "  
+        f"القيمة الحالية: {value}"  
+    )
 
 def load_symbols():
-    with open(
-        SYMBOLS_FILE,
-        "r",
-        encoding="utf-8",
-    ) as f:
-        data = json.load(f)
 
-    result = {}
+with open(  
+    SYMBOLS_FILE,  
+    "r",  
+    encoding="utf-8"  
+) as f:  
 
-    for item in data.get("symbols", []):
-        symbol = str(item.get("symbol", "")).strip()
+    data = json.load(f)  
 
-        if not symbol:
-            continue
+if isinstance(data, list):  
 
-        result[symbol] = item
+    items = data  
 
-    return result
+elif isinstance(data, dict):  
 
+    items = data.get(  
+        "symbols",  
+        data.get("records", [])  
+    )  
 
-def fetch_day(date_string):
-    params = {
-        "adjusted": "true",
-        "apiKey": API_KEY,
-    }
+else:  
 
-    url = f"{MASSIVE_URL}/{date_string}"
+    items = []  
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=120,
-    )
+result = {}  
 
-    if response.status_code != 200:
-        print(
-            f"HTTP {response.status_code} "
-            f"for {date_string}"
-        )
-        return None
+for item in items:  
 
-    try:
-        return response.json()
-    except Exception:
-        print(
-            f"Invalid JSON returned for {date_string}"
-        )
-        return None
+    if isinstance(item, str):  
 
+        symbol = item  
 
-def build_daily_records(raw, symbols, date_string):
-    if not raw:
-        return []
+        result[symbol] = {  
+            "symbol": symbol  
+        }  
 
-    results = raw.get("results", [])
+    elif isinstance(item, dict):  
 
-    if not isinstance(results, list):
-        return []
+        symbol = (  
+            item.get("symbol")  
+            or item.get("ticker")  
+        )  
 
-    records = []
+        if symbol:  
+            result[symbol] = item  
 
-    for item in results:
-        symbol = str(
-            item.get("T", "")
-        ).strip()
+return result
 
-        if not symbol:
-            continue
+def is_weekend(d):
 
-        metadata = symbols.get(symbol)
+return d.weekday() >= 5
 
-        if not metadata:
-            continue
+def existing_file(d):
 
-        record = {
-            "symbol": symbol,
-            "date": date_string,
-            "open": item.get("o"),
-            "high": item.get("h"),
-            "low": item.get("l"),
-            "close": item.get("c"),
-            "volume": item.get("v"),
-            "market_cap": metadata.get("market_cap"),
-            "sector": metadata.get("sector"),
-            "industry": metadata.get("industry"),
-            "name": metadata.get("name"),
-            "exchange": metadata.get("exchange"),
-        }
+return os.path.join(  
+    DAILY_DATA_DIR,  
+    f"{d.isoformat()}.json"  
+)
 
-        records.append(record)
+def fetch_day(d):
 
-    return records
+url = f"{API_URL}/{d.isoformat()}"  
 
+params = {  
+    "apiKey": API_KEY,  
+    "adjusted": "true",  
+    "include_otc": "false"  
+}  
 
-def load_existing_file(path):
-    if not os.path.exists(path):
-        return None
+response = requests.get(  
+    url,  
+    params=params,  
+    timeout=60  
+)  
 
-    try:
-        with open(
-            path,
-            "r",
-            encoding="utf-8",
-        ) as f:
-            return json.load(f)
+if response.status_code == 401:  
 
-    except Exception as e:
-        print(
-            f"تحذير: تعذر قراءة {path}: {e}"
-        )
-        return None
+    raise RuntimeError(  
+        "Massive رفض مفتاح API. "  
+        "تأكد من MASSIVE_API_KEY."  
+    )  
 
+if response.status_code == 403:  
 
-def merge_existing_file(
-    path,
-    new_records,
-    date_string,
+    raise RuntimeError(  
+        "Massive أعاد 403. "  
+        "تأكد من صلاحية Daily Market Summary."  
+    )  
+
+if response.status_code == 429:  
+
+    raise RuntimeError(  
+        "تم تجاوز حد Massive: "  
+        "5 طلبات/دقيقة."  
+    )  
+
+response.raise_for_status()  
+
+return response.json()
+
+def build_daily_records(
+raw,
+symbols,
+d
 ):
-    """
-    مهم جداً:
 
-    إذا كان الملف موجوداً من NASDAQ فقط:
-    - لا نحذفه.
-    - لا نستبدل بياناته.
-    - لا نعيد بناء الملف من الصفر.
-    - نضيف فقط رموز NYSE الناقصة.
-    - نضيف exchange للسجلات القديمة إذا كان
-      معروفاً من symbols-reference.json.
+records = []  
 
-    هذا يجعل إضافة NYSE آمنة على التاريخ القديم.
-    """
+results = raw.get(  
+    "results",  
+    []  
+)  
 
-    existing = load_existing_file(path)
+for item in results:  
 
-    if existing is None:
-        return False, len(new_records), 0
+    symbol = item.get("T")  
 
-    existing_records = existing.get("data", [])
+    if not symbol:  
+        continue  
 
-    if not isinstance(existing_records, list):
-        print(
-            f"تحذير: بنية {path} غير متوقعة."
-        )
-        return False, 0, 0
+    # فقط الرموز الموجودة في  
+    # symbols-reference.json  
+    metadata = symbols.get(symbol)  
 
-    existing_by_symbol = {}
+    if metadata is None:  
+        continue  
 
-    for record in existing_records:
-        symbol = str(
-            record.get("symbol", "")
-        ).strip()
+    record = {  
+        "symbol": symbol,  
+        "date": d.isoformat(),  
 
-        if symbol:
-            existing_by_symbol[symbol] = record
+        "open": item.get("o"),  
+        "high": item.get("h"),  
+        "low": item.get("l"),  
+        "close": item.get("c"),  
+        "volume": item.get("v"),  
 
-    added = 0
-    enriched = 0
+        "market_cap": metadata.get(  
+            "market_cap",  
+            0.0  
+        ),  
 
-    for new_record in new_records:
-        symbol = new_record["symbol"]
+        "sector": metadata.get(  
+            "sector"  
+        ),  
 
-        if symbol not in existing_by_symbol:
-            existing_records.append(new_record)
-            existing_by_symbol[symbol] = new_record
-            added += 1
-            continue
+        "industry": metadata.get(  
+            "industry"  
+        ),  
 
-        # لا نغيّر بيانات OHLCV القديمة.
-        # فقط نضيف exchange إذا كان مفقوداً.
-        existing_record = existing_by_symbol[symbol]
+        "name": metadata.get(  
+            "name"  
+        )  
+    }  
 
-        if (
-            "exchange" not in existing_record
-            and new_record.get("exchange")
-        ):
-            existing_record["exchange"] = (
-                new_record["exchange"]
-            )
-            enriched += 1
+    records.append(record)  
 
-    if added == 0 and enriched == 0:
-        return False, 0, 0
+return records
 
-    # نحافظ على التاريخ.
-    existing["date"] = date_string
-
-    existing["total_records"] = len(
-        existing_records
-    )
-
-    existing["data"] = existing_records
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            existing,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return True, added, enriched
-
-
-def save_new_day(
-    path,
-    date_string,
-    records,
+def save_day(
+d,
+records
 ):
-    output = {
-        "date": date_string,
-        "total_records": len(records),
-        "data": records,
-    }
 
-    with open(
-        path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            output,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+os.makedirs(  
+    DAILY_DATA_DIR,  
+    exist_ok=True  
+)  
 
+path = existing_file(d)  
 
-def process_day(
-    date_string,
-    symbols,
-):
-    os.makedirs(
-        DAILY_DIR,
-        exist_ok=True,
-    )
+# لا نلمس أي ملف موجود  
+if os.path.exists(path):  
 
-    path = os.path.join(
-        DAILY_DIR,
-        f"{date_string}.json",
-    )
+    print(  
+        f"{d}: الملف موجود مسبقًا - تخطي"  
+    )  
 
-    existing = load_existing_file(path)
+    return  
 
-    # إذا كان الملف موجوداً، نفحص هل يحتاج إلى
-    # إضافة NYSE أم أنه مكتمل بالفعل.
-    if existing is not None:
-        existing_records = existing.get(
-            "data",
-            [],
-        )
+output = {  
+    "date": d.isoformat(),  
 
-        existing_symbols = set()
+    "generated_at": datetime.now(  
+        timezone.utc  
+    ).isoformat(),  
 
-        for record in existing_records:
-            symbol = str(
-                record.get("symbol", "")
-            ).strip()
+    "total_records": len(records),  
 
-            if symbol:
-                existing_symbols.add(symbol)
+    "records": records  
+}  
 
-        nyse_symbols = {
-            symbol
-            for symbol, metadata in symbols.items()
-            if metadata.get("exchange") == "NYSE"
-        }
+with open(  
+    path,  
+    "w",  
+    encoding="utf-8"  
+) as f:  
 
-        missing_nyse = nyse_symbols - existing_symbols
+    json.dump(  
+        output,  
+        f,  
+        ensure_ascii=False,  
+        indent=2  
+    )  
 
-        # إذا كانت رموز NYSE موجودة بالفعل،
-        # لا نستهلك طلباً من Massive بلا داعٍ.
-        if not missing_nyse:
-            print(
-                f"{date_string}: موجود ومكتمل، تخطي."
-            )
-            return False
-
-        print(
-            f"{date_string}: ملف موجود لكن ينقصه "
-            f"{len(missing_nyse):,} رمز NYSE، سيتم الدمج."
-        )
-
-    raw = fetch_day(date_string)
-
-    if not raw:
-        print(
-            f"{date_string}: لا توجد بيانات."
-        )
-        return False
-
-    new_records = build_daily_records(
-        raw,
-        symbols,
-        date_string,
-    )
-
-    if not new_records:
-        print(
-            f"{date_string}: لا توجد سجلات مطابقة."
-        )
-        return False
-
-    if existing is None:
-        save_new_day(
-            path,
-            date_string,
-            new_records,
-        )
-
-        print(
-            f"{date_string}: تم إنشاء الملف "
-            f"بـ {len(new_records):,} سجل."
-        )
-
-        return True
-
-    changed, added, enriched = merge_existing_file(
-        path,
-        new_records,
-        date_string,
-    )
-
-    if changed:
-        print(
-            f"{date_string}: تمت إضافة "
-            f"{added:,} سجل جديد، "
-            f"وإثراء {enriched:,} سجل."
-        )
-    else:
-        print(
-            f"{date_string}: لا توجد إضافات."
-        )
-
-    return changed
-
-
-def daterange_desc(start_date, end_date):
-    current = end_date - timedelta(days=1)
-
-    while current >= start_date:
-        yield current
-        current -= timedelta(days=1)
-
+print(  
+    f"{d}: تم الحفظ - "  
+    f"{len(records)} سجل"  
+)
 
 def main():
-    if not API_KEY:
-        print(
-            "ERROR: MASSIVE_API_KEY غير موجود.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-    symbols = load_symbols()
+if not API_KEY:  
 
-    if not symbols:
-        print(
-            "ERROR: symbols-reference.json فارغ.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    raise RuntimeError(  
+        "MASSIVE_API_KEY غير موجود "  
+        "في GitHub Secrets."  
+    )  
 
-    exchange_counts = {}
+from_date = parse_date(  
+    BACKFILL_FROM,  
+    "BACKFILL_FROM"  
+)  
 
-    for metadata in symbols.values():
-        exchange = metadata.get(
-            "exchange",
-            "UNKNOWN",
-        )
+to_date = parse_date(  
+    BACKFILL_TO,  
+    "BACKFILL_TO"  
+)  
 
-        exchange_counts[exchange] = (
-            exchange_counts.get(exchange, 0) + 1
-        )
+if from_date >= to_date:  
 
-    print(
-        f"إجمالي الرموز: {len(symbols):,}"
-    )
-    print(
-        f"NASDAQ: {exchange_counts.get('NASDAQ', 0):,}"
-    )
-    print(
-        f"NYSE: {exchange_counts.get('NYSE', 0):,}"
-    )
+    raise RuntimeError(  
+        "BACKFILL_FROM يجب أن يكون "  
+        "أقدم من BACKFILL_TO."  
+    )  
 
-    start_date = datetime.strptime(
-        BACKFILL_FROM,
-        "%Y-%m-%d",
-    ).date()
+symbols = load_symbols()  
 
-    end_date = datetime.strptime(
-        BACKFILL_TO,
-        "%Y-%m-%d",
-    ).date()
+print()  
+print("=" * 70)  
+print("NASDAQ HISTORICAL BACKFILL")  
+print("=" * 70)  
 
-    if end_date <= start_date:
-        print(
-            "ERROR: BACKFILL_TO يجب أن يكون بعد BACKFILL_FROM.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+print(  
+    f"عدد الرموز: {len(symbols)}"  
+)  
 
-    processed = 0
-    changed = 0
-    skipped_weekends = 0
+print(  
+    f"من: {from_date}"  
+)  
 
-    for current in daterange_desc(
-        start_date,
-        end_date,
-    ):
-        date_string = current.isoformat()
+print(  
+    f"إلى: {to_date}"  
+)  
 
-        # السبت والأحد
-        if current.weekday() >= 5:
-            skipped_weekends += 1
-            continue
+print(  
+    f"سيتم جلب الأيام: "  
+    f"{from_date} → {to_date - timedelta(days=1)}"  
+)  
 
-        try:
-            did_change = process_day(
-                date_string,
-                symbols,
-            )
+print("=" * 70)  
 
-            processed += 1
+# نبدأ من اليوم السابق لـ BACKFILL_TO  
+#  
+# مثال:  
+# BACKFILL_TO = 2026-01-01  
+#  
+# البداية الفعلية:  
+# 2025-12-31  
+#  
+# ونستمر إلى:  
+# 2025-01-01  
+current_date = (  
+    to_date - timedelta(days=1)  
+)  
 
-            if did_change:
-                changed += 1
+downloaded_days = 0  
+skipped_days = 0  
+empty_days = 0  
 
-        except Exception as e:
-            print(
-                f"ERROR {date_string}: {e}",
-                file=sys.stderr,
-            )
+while current_date >= from_date:  
 
-        time.sleep(REQUEST_DELAY)
+    d = current_date  
 
-    print()
-    print("انتهى التاريخ التاريخي.")
-    print(f"أيام التداول المعالجة: {processed:,}")
-    print(f"أيام تم تعديلها/إنشاؤها: {changed:,}")
-    print(f"أيام نهاية الأسبوع المتجاهلة: {skipped_weekends:,}")
+    print()  
+    print("=" * 70)  
+    print(  
+        f"التاريخ: {d}"  
+    )  
+    print("=" * 70)  
 
+    # السبت والأحد  
+    if is_weekend(d):  
 
-if __name__ == "__main__":
-    main()
+        print(  
+            f"{d}: عطلة نهاية الأسبوع - تخطي"  
+        )  
+
+        skipped_days += 1  
+
+        current_date -= timedelta(days=1)  
+
+        continue  
+
+    # الملف موجود مسبقًا  
+    if os.path.exists(  
+        existing_file(d)  
+    ):  
+
+        print(  
+            f"{d}: موجود مسبقًا - لن نلمسه"  
+        )  
+
+        skipped_days += 1  
+
+        current_date -= timedelta(days=1)  
+
+        continue  
+
+    try:  
+
+        raw = fetch_day(d)  
+
+    except Exception as e:  
+
+        print()  
+        print(  
+            f"فشل جلب {d}: {e}"  
+        )  
+
+        print(  
+            "تم إيقاف التشغيل. "  
+            "عند إعادة تشغيل Workflow "  
+            "سيتم تخطي الملفات التي تم حفظها."  
+        )  
+
+        raise  
+
+    status = raw.get(  
+        "status"  
+    )  
+
+    if status != "OK":  
+
+        print(  
+            f"{d}: لا توجد بيانات - {status}"  
+        )  
+
+        empty_days += 1  
+
+        current_date -= timedelta(days=1)  
+
+        time.sleep(  
+            REQUEST_DELAY  
+        )  
+
+        continue  
+
+    records = build_daily_records(  
+        raw,  
+        symbols,  
+        d  
+    )  
+
+    if not records:  
+
+        print(  
+            f"{d}: لم نجد رموز NASDAQ."  
+        )  
+
+        empty_days += 1  
+
+        current_date -= timedelta(days=1)  
+
+        time.sleep(  
+            REQUEST_DELAY  
+        )  
+
+        continue  
+
+    save_day(  
+        d,  
+        records  
+    )  
+
+    downloaded_days += 1  
+
+    print(  
+        f"{d}: تم الحصول على "  
+        f"{len(records)} سجل NASDAQ"  
+    )  
+
+    # انتظار احترامًا لحد API  
+    print(  
+        f"انتظار {REQUEST_DELAY} ثانية..."  
+    )  
+
+    time.sleep(  
+        REQUEST_DELAY  
+    )  
+
+    current_date -= timedelta(days=1)  
+
+print()  
+print("=" * 70)  
+print("اكتمل التشغيل")  
+print("=" * 70)  
+
+print(  
+    f"النطاق: "  
+    f"{from_date} → "  
+    f"{to_date - timedelta(days=1)}"  
+)  
+
+print(  
+    f"أيام تم جلبها: "  
+    f"{downloaded_days}"  
+)  
+
+print(  
+    f"أيام تم تخطيها: "  
+    f"{skipped_days}"  
+)  
+
+print(  
+    f"أيام بدون بيانات: "  
+    f"{empty_days}"  
+)  
+
+print("=" * 70)
+
+if name == "main":
+main()
