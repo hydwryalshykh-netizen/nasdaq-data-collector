@@ -1,92 +1,65 @@
 import csv
 import io
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 
 import requests
 
 
-NASDAQ_URL = "https://api.nasdaq.com/api/screener/stocks"
+SYMBOLS_FILE = "symbols-reference.json"
 
-NYSE_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-
-OUTPUT_FILE = "symbols-reference.json"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NASDAQ-Data-Collector/1.0)",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nasdaq.com/",
-}
+NYSE_URL = (
+    "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+)
 
 
 def clean_text(value):
     if value is None:
         return ""
+
     return str(value).strip()
 
 
-def fetch_nasdaq_symbols():
-    print("جلب قائمة NASDAQ...")
+def run_existing_nasdaq_script():
+    """
+    لا نعيد بناء نظام NASDAQ القديم.
+    نشغل السكربت الموجود أصلاً والذي كان يعمل
+    ونستخدم ناتجه كما هو.
+    """
 
-    params = {
-        "tableonly": "true",
-        "limit": 10000,
-        "offset": 0,
-        "download": "true",
-        "exchange": "nasdaq",
-    }
+    print("تشغيل سكربت NASDAQ الموجود أصلاً...")
 
-    response = requests.get(
-        NASDAQ_URL,
-        headers=HEADERS,
-        params=params,
-        timeout=60,
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/fetch-nasdaq-symbols.py",
+        ],
+        check=True,
     )
 
-    response.raise_for_status()
+    with open(
+        SYMBOLS_FILE,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        data = json.load(f)
 
-    data = response.json()
+    symbols = data.get("symbols", [])
 
-    rows = (
-        data.get("data", {})
-        .get("table", {})
-        .get("rows", [])
-    )
-
-    if not rows:
-        raise RuntimeError("لم يتم العثور على أسهم NASDAQ.")
-
-    symbols = []
-
-    for row in rows:
-        symbol = clean_text(row.get("symbol"))
-
-        if not symbol:
-            continue
-
-        symbols.append({
-            "symbol": symbol,
-            "name": clean_text(row.get("name")),
-            "last_sale": row.get("lastsale"),
-            "net_change": row.get("netchange"),
-            "change_percent": row.get("pctchange"),
-            "market_cap": row.get("marketCap"),
-            "country": clean_text(row.get("country")),
-            "ipo_year": row.get("ipoyear"),
-            "volume": row.get("volume"),
-            "sector": clean_text(row.get("sector")),
-            "industry": clean_text(row.get("industry")),
-            "exchange": "NASDAQ",
-        })
-
-    if len(symbols) < 1000:
+    if not symbols:
         raise RuntimeError(
-            f"عدد أسهم NASDAQ منخفض بشكل غير طبيعي: {len(symbols)}"
+            "سكربت NASDAQ الموجود لم يُرجع أي رموز."
         )
 
-    print(f"NASDAQ: {len(symbols):,} رمز")
+    print(
+        f"NASDAQ الموجود: {len(symbols):,} رمز"
+    )
+
+    # نضيف exchange فقط بدون تغيير بيانات NASDAQ الأخرى.
+    for item in symbols:
+        item["exchange"] = "NASDAQ"
 
     return symbols
 
@@ -97,113 +70,125 @@ def fetch_nyse_symbols():
     response = requests.get(
         NYSE_URL,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; NASDAQ-Data-Collector/1.0)"
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; NASDAQ-Data-Collector/1.0)"
+            )
         },
         timeout=60,
     )
 
     response.raise_for_status()
 
-    text = response.text
-
     reader = csv.DictReader(
-        io.StringIO(text),
+        io.StringIO(response.text),
         delimiter="|",
     )
 
     symbols = []
 
     for row in reader:
-        exchange = clean_text(row.get("Exchange"))
-        test_issue = clean_text(row.get("Test Issue")).upper()
+
+        exchange = clean_text(
+            row.get("Exchange")
+        )
+
+        test_issue = clean_text(
+            row.get("Test Issue")
+        ).upper()
 
         # N = New York Stock Exchange
         if exchange != "N":
             continue
 
-        # استبعاد الاختبارات
+        # استبعاد Test Issues
         if test_issue == "Y":
             continue
 
-        # نستخدم NASDAQ Symbol لأنه معرف السوق المستخدم في
-        # بروتوكولات Nasdaq وبيانات السوق.
-        symbol = clean_text(row.get("NASDAQ Symbol"))
+        # نستخدم NASDAQ Symbol إذا كان موجوداً.
+        symbol = clean_text(
+            row.get("NASDAQ Symbol")
+        )
 
         if not symbol:
-            # fallback
-            symbol = clean_text(row.get("CQS Symbol"))
+            symbol = clean_text(
+                row.get("CQS Symbol")
+            )
 
         if not symbol:
-            symbol = clean_text(row.get("ACT Symbol"))
+            symbol = clean_text(
+                row.get("ACT Symbol")
+            )
 
         if not symbol:
             continue
 
-        security_name = clean_text(row.get("Security Name"))
+        name = clean_text(
+            row.get("Security Name")
+        )
 
-        # استبعاد أدوات واضحة ليست أسهماً عادية.
-        # ETF = Y يعني ETF وليس سهماً.
-        etf = clean_text(row.get("ETF")).upper()
+        # نستبعد ETF فقط.
+        # لا نستخدم فلترة اسمية واسعة حتى لا نحذف
+        # أسهماً صحيحة بالخطأ.
+        etf = clean_text(
+            row.get("ETF")
+        ).upper()
 
         if etf == "Y":
             continue
 
-        lower_name = security_name.lower()
-
-        excluded_terms = [
-            "warrant",
-            "rights",
-            " right ",
-            "notes due",
-            "debenture",
-            "preferred stock",
-            "depositary share",
-            "unit,",
-        ]
-
-        if any(term in lower_name for term in excluded_terms):
-            continue
-
-        symbols.append({
-            "symbol": symbol,
-            "name": security_name,
-            "last_sale": None,
-            "net_change": None,
-            "change_percent": None,
-            "market_cap": None,
-            "country": None,
-            "ipo_year": None,
-            "volume": None,
-            "sector": None,
-            "industry": None,
-            "exchange": "NYSE",
-        })
-
-    if len(symbols) < 1000:
-        raise RuntimeError(
-            f"عدد أسهم NYSE منخفض بشكل غير طبيعي: {len(symbols)}"
+        symbols.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "last_sale": None,
+                "net_change": None,
+                "change_percent": None,
+                "market_cap": None,
+                "country": None,
+                "ipo_year": None,
+                "volume": None,
+                "sector": None,
+                "industry": None,
+                "exchange": "NYSE",
+            }
         )
 
-    print(f"NYSE: {len(symbols):,} رمز")
+    if not symbols:
+        raise RuntimeError(
+            "لم يتم العثور على أسهم NYSE."
+        )
+
+    print(
+        f"NYSE: {len(symbols):,} رمز"
+    )
 
     return symbols
 
 
-def merge_symbols(nasdaq_symbols, nyse_symbols):
+def merge_symbols(
+    nasdaq_symbols,
+    nyse_symbols,
+):
     """
-    دمج NASDAQ + NYSE مع منع تكرار الرمز.
+    نحافظ على NASDAQ كما هو أولاً.
+    ثم نضيف NYSE.
 
-    إذا ظهر نفس الرمز في السوقين، نحتفظ بأول نسخة
-    حتى لا ينكسر النظام الحالي الذي يعتمد على symbol كمفتاح.
+    إذا كان نفس الرمز موجوداً في السوقين،
+    لا نكرر الرمز لأن بقية النظام يعتمد على
+    symbol كمفتاح.
     """
 
     merged = []
     seen = set()
+
     duplicate_count = 0
 
-    # NASDAQ أولاً حتى نحافظ على سلوك النظام السابق.
     for item in nasdaq_symbols:
-        symbol = clean_text(item.get("symbol"))
+
+        symbol = clean_text(
+            item.get("symbol")
+        )
 
         if not symbol:
             continue
@@ -216,7 +201,10 @@ def merge_symbols(nasdaq_symbols, nyse_symbols):
         merged.append(item)
 
     for item in nyse_symbols:
-        symbol = clean_text(item.get("symbol"))
+
+        symbol = clean_text(
+            item.get("symbol")
+        )
 
         if not symbol:
             continue
@@ -230,48 +218,89 @@ def merge_symbols(nasdaq_symbols, nyse_symbols):
 
     if duplicate_count:
         print(
-            f"تحذير: تم تجاهل {duplicate_count:,} رمز مكرر "
-            "لأن النظام يعتمد على symbol كمفتاح."
+            f"تحذير: تم تجاهل "
+            f"{duplicate_count:,} رمز مكرر."
         )
 
     return merged
 
 
 def main():
+
     try:
-        nasdaq_symbols = fetch_nasdaq_symbols()
-        nyse_symbols = fetch_nyse_symbols()
+
+        # =====================================================
+        # 1. NASDAQ
+        # نستخدم السكربت القديم الذي كان يعمل.
+        # =====================================================
+
+        nasdaq_symbols = (
+            run_existing_nasdaq_script()
+        )
+
+        # =====================================================
+        # 2. NYSE
+        # =====================================================
+
+        nyse_symbols = (
+            fetch_nyse_symbols()
+        )
+
+        # =====================================================
+        # 3. دمج NASDAQ + NYSE
+        # =====================================================
 
         symbols = merge_symbols(
             nasdaq_symbols,
             nyse_symbols,
         )
 
-        if len(symbols) < 2000:
+        if not symbols:
             raise RuntimeError(
-                f"إجمالي الرموز منخفض بشكل غير طبيعي: {len(symbols)}"
+                "قائمة الرموز النهائية فارغة."
             )
 
         exchange_counts = {}
 
         for item in symbols:
-            exchange = item.get("exchange", "UNKNOWN")
-            exchange_counts[exchange] = (
-                exchange_counts.get(exchange, 0) + 1
+
+            exchange = item.get(
+                "exchange",
+                "UNKNOWN",
             )
 
+            exchange_counts[exchange] = (
+                exchange_counts.get(
+                    exchange,
+                    0,
+                )
+                + 1
+            )
+
+        # =====================================================
+        # 4. حفظ نفس symbols-reference.json
+        # =====================================================
+
         output = {
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "total_symbols": len(symbols),
+            "fetched_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+            "total_symbols": len(
+                symbols
+            ),
+
             "exchanges": exchange_counts,
+
             "symbols": symbols,
         }
 
         with open(
-            OUTPUT_FILE,
+            SYMBOLS_FILE,
             "w",
             encoding="utf-8",
         ) as f:
+
             json.dump(
                 output,
                 f,
@@ -280,13 +309,40 @@ def main():
             )
 
         print()
-        print("تم إنشاء symbols-reference.json بنجاح.")
-        print(f"الإجمالي: {len(symbols):,}")
-        print(f"NASDAQ: {exchange_counts.get('NASDAQ', 0):,}")
-        print(f"NYSE: {exchange_counts.get('NYSE', 0):,}")
+        print(
+            "========================================"
+        )
+        print(
+            "تم دمج NASDAQ + NYSE بنجاح"
+        )
+        print(
+            "========================================"
+        )
+        print(
+            f"NASDAQ: "
+            f"{exchange_counts.get('NASDAQ', 0):,}"
+        )
+        print(
+            f"NYSE: "
+            f"{exchange_counts.get('NYSE', 0):,}"
+        )
+        print(
+            f"TOTAL: "
+            f"{len(symbols):,}"
+        )
+
+    except subprocess.CalledProcessError:
+        print(
+            "ERROR: سكربت NASDAQ الموجود فشل.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(
+            f"ERROR: {e}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
