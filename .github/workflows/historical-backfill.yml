@@ -1,73 +1,62 @@
-name: جمع بيانات NASDAQ + NYSE التاريخية
+name: جمع بيانات NASDAQ التاريخية
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
+inputs:
 
-    inputs:
+from_date:  
+    description: "تاريخ البداية - شامل"  
+    required: true  
+    default: "2025-01-01"  
 
-      from_date:
-        description: "تاريخ البداية YYYY-MM-DD"
-        required: true
-        default: "2025-01-01"
-
-      to_date:
-        description: "تاريخ النهاية الحصرية YYYY-MM-DD"
-        required: true
-        default: "2026-10-01"
+  to_date:  
+    description: "تاريخ النهاية - غير شامل"  
+    required: true  
+    default: "2026-01-01"
 
 jobs:
 
-  collect-historical-data:
+collect-historical-data:
 
-    runs-on: ubuntu-latest
+runs-on: ubuntu-latest  
 
-    timeout-minutes: 360
+timeout-minutes: 360  
 
-    steps:
+steps:  
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  - name: تحميل المستودع  
+    uses: actions/checkout@v4  
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+  - name: إعداد Python  
+    uses: actions/setup-python@v5  
+    with:  
+      python-version: "3.11"  
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+  - name: تثبيت المكتبات  
+    run: |  
+      pip install requests  
 
-      # =========================================================
-      # تحديث قائمة NASDAQ + NYSE أولاً
-      # =========================================================
-      - name: Fetch NASDAQ + NYSE symbols
-        run: |
-          python scripts/fetch-us-symbols.py
+  - name: جلب البيانات التاريخية  
+    env:  
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}  
 
-      # =========================================================
-      # إضافة NYSE إلى التاريخ الموجود
-      # مع المحافظة على NASDAQ الموجود
-      # =========================================================
-      - name: Collect historical NASDAQ + NYSE data
-        run: |
-          python scripts/fetch-massive-historical.py
-        env:
-          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-          BACKFILL_FROM: ${{ inputs.from_date }}
-          BACKFILL_TO: ${{ inputs.to_date }}
+      BACKFILL_FROM: ${{ inputs.from_date }}  
+      BACKFILL_TO: ${{ inputs.to_date }}  
 
-      # =========================================================
-      # حفظ التغييرات
-      # =========================================================
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    run: |  
+      python scripts/fetch-massive-historical.py  
 
-          git add daily-data/ symbols-reference.json
+  - name: حفظ البيانات  
+    run: |  
 
-          git diff --cached --quiet || \
-            git commit -m "إضافة بيانات NYSE التاريخية مع الحفاظ على NASDAQ"
+      git config user.name "GitHub Actions Bot"  
 
-          git push
+      git config user.email "actions@github.com"  
+
+      git add daily-data/  
+
+      git commit \  
+        -m "إضافة بيانات NASDAQ التاريخية من ${{ inputs.from_date }} إلى ${{ inputs.to_date }}" \  
+        || echo "لا توجد تغييرات جديدة"  
+
+      git push
