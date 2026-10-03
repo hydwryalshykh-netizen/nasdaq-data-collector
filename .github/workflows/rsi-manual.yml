@@ -1,0 +1,42 @@
+name: تحديث RSI يدوي (اختبار / حفظ)
+
+on:
+  workflow_dispatch:
+    inputs:
+      save:
+        description: "هل تحفظ rsi-state.json في المستودع؟ (false = اختبار فقط، true = حفظ)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  rsi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: تحميل المستودع
+        uses: actions/checkout@v4
+
+      - name: إعداد بايثون
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: تثبيت المكتبات
+        run: pip install numpy pandas openpyxl requests
+
+      - name: تحديث RSI وإرسال تيليجرام
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/update-rsi.py
+
+      - name: حفظ rsi-state.json (فقط إذا save = true)
+        if: ${{ inputs.save == 'true' }}
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add rsi-state.json
+          git commit -m "تحديث RSI يدوي $(date +'%Y-%m-%d')" || echo "لا توجد تغييرات جديدة"
+          git push
