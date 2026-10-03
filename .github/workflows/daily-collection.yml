@@ -49,10 +49,19 @@ jobs:
       - name: دمج البيانات وتحديث الأرشيف وتنظيف الملفات القديمة
         run: python scripts/merge-and-cleanup.py
 
+      - name: تحديث RSI وإرسال التنبيهات والقائمة إلى تيليجرام
+        continue-on-error: true   # إذا فشل هذا الخطوة تُحفظ بيانات اليوم كالمعتاد
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          pip install numpy pandas openpyxl requests
+          python scripts/update-rsi.py
+
       - name: حفظ التحديثات بالمستودع
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
-          git add daily-data/ latest.json symbols-reference.json
+          git add daily-data/ latest.json symbols-reference.json rsi-state.json
           git commit -m "تحديث بيانات $(date +'%Y-%m-%d')" || echo "لا توجد تغييرات جديدة لحفظها"
           git push
