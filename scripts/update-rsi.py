@@ -39,6 +39,20 @@ def apply_day(state, date, records, pcs=None):
         if advance(s, c, date, v, (pcs or {}).get(sym)): n += 1
     return n, new
 
+def load_universe(files):
+    """أسهم المستودع = NASDAQ + NYSE: من symbols-reference.json؛ وإن تعذّر فمن أحدث ملف في daily-data."""
+    try:
+        sy = json.load(open(P('symbols-reference.json'), encoding='utf-8'))['symbols']
+        u = {norm_symbol(x['symbol']) for x in sy if x.get('symbol')}
+        if len(u) > 1000: return u, 'symbols-reference.json'
+    except Exception as e:
+        print('تعذّر قراءة symbols-reference.json:', e)
+    fs = sorted(glob.glob(os.path.join(DAILY, '*.json')))
+    if fs:
+        d = json.load(open(fs[-1], encoding='utf-8'))
+        return {norm_symbol(x['symbol']) for x in d['records'] if x.get('symbol')}, os.path.basename(fs[-1])
+    return None, 'غير متاح'
+
 def tg_text(text):
     if not TOK: print(text); return
     for i in range(0, len(text), 3800):
@@ -64,14 +78,12 @@ def main():
         print(f'  {date}: دُمج {n} سهم، جديد {new}')
     json.dump(state, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     last = max(s['last_date'] for s in state.values())
-    df = rows(state); ad = alerts(state, last)
-    out = P('rsi-list.xlsx'); write_xlsx(out, df, ad, last)
-    lo = ad[ad['السعر'] >= 12] if len(ad) else ad; hi = ad[ad['السعر'] < 12] if len(ad) else ad
-    def line(r): return f"{r['الرمز']}  ${r['السعر']}  RSI {r['RSI_الحالي']}  | {r['نوع_التنبيه']} | أحمر {r['القاع_الاحمر']} ، أصفر {r['الاصفر_الادنى']}-{r['الاصفر_الاعلى']}" + ('  ⚠️سيولة' if r['تنبيه_سيولة'] else '') + (f"  🔁{r['ملاحظة']}" if r['ملاحظة'] else '')
-    msg = [f'📊 RSI — {last}  |  أسهم القائمة {len(df):,}  |  تنبيهات {len(ad)}']
-    if len(lo): msg += ['', f'🟡 سعر ≥ 12$ — قبل الأصفر الأدنى ({len(lo)}):'] + [line(r) for _, r in lo.iterrows()]
-    if len(hi): msg += ['', f'🔴 سعر < 12$ — قبل القاع الأحمر ({len(hi)}):'] + [line(r) for _, r in hi.iterrows()]
-    if not len(ad): msg += ['', 'لا توجد تنبيهات اليوم.']
-    tg_text('\n'.join(msg)); tg_file(out, f'قائمة RSI كاملة — {last}')
+    universe, src = load_universe(files)
+    df = rows(state); ad = alerts(state, last, universe)
+    print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
+    out = P('rsi-list.xlsx'); cnt = write_xlsx(out, df, ad, last)
+    a50, a12, a0 = (cnt['2_تنبيه_سعر_فوق_50'], cnt['3_تنبيه_سعر_12_الى_50'], cnt['4_تنبيه_سعر_تحت_12'])
+    caption = f'📊 RSI {last}\nالقائمة الرئيسية: {len(df):,} سهم (كل السوق)\nالتنبيهات (NASDAQ + NYSE فقط) — فوق 50$: {a50} | 12–50$: {a12} | تحت 12$: {a0}'
+    print(caption); tg_file(out, caption)      # ملف واحد فقط، بلا رسائل نصية
 
 if __name__ == '__main__': main()
