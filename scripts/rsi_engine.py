@@ -202,8 +202,10 @@ def classify(x, red, yl, yh):
     return 'أصفر' if x <= yh + 1e-9 else '-'
 
 def alert(price, rsi, red, yl):
-    """سعر>=12$: قبل الأصفر الأدنى بنقطتين أو أقل (أو داخله) | سعر<12$: قبل القاع الأحمر بنقطتين أو أقل."""
-    ref, name = (yl, 'أصفر أدنى') if price >= 12 else (red, 'قاع أحمر')
+    """سعر>=12$: قبل الأصفر الأدنى بنقطتين أو أقل (أو داخله) | سعر<12$: قبل القاع الأحمر بنقطتين أو أقل.
+    القاع الأحمر يُعتمد فقط إذا كان فعلاً قاعاً (تحت 35)؛ سهم لم ينزل تحت 35 قط (مثل SPAC جديد) لا يوجد له أحمر حقيقي."""
+    if price >= 12: ref, name = yl, 'أصفر أدنى'
+    else: ref, name = (red, 'قاع أحمر') if (red is not None and red < CAP) else (None, None)
     if ref is None or rsi is None: return None
     if rsi <= ref: return (f'{name} - داخل المنطقة', 0.0, name)
     if rsi <= ref + 2: return (f'{name} - اقتراب (≤2 نقطة)', round(rsi - ref, 2), name)
