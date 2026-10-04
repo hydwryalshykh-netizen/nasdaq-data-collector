@@ -22,11 +22,12 @@ def rows(state):
     df['_k'] = df['نوع_المنطقة_الحالية'].map(lambda z: 0 if z.startswith('أحمر') else (1 if z == 'أصفر' else 2))
     return df.sort_values(['_k', 'RSI_الحالي', 'الرمز'], na_position='last').drop(columns='_k').reset_index(drop=True)
 
-def alerts(state, fresh_date):
-    """تنبيه فقط للأسهم المحدَّثة في يوم التداول الأخير (fresh_date) كي لا تتكرر تنبيهات أسهم توقف تداولها."""
+def alerts(state, fresh_date, universe=None):
+    """تنبيه فقط للأسهم المحدَّثة في يوم التداول الأخير (fresh_date)، وإن حُدّد universe فمن ضمنه فقط (NASDAQ+NYSE)."""
     out = []
     for t, s in state.items():
         if 'pending' in s or s['last_date'] != fresh_date: continue
+        if universe is not None and t not in universe: continue
         yl, yh = zone(s); p = s['last_close']; a = alert(p, s['rsi'], s['hist_low_rsi'], yl)
         if not a: continue
         sp = [f"{d} ×{r}" for d, r in s.get('splits', []) if d >= cut6(fresh_date)]
@@ -43,18 +44,24 @@ def alerts(state, fresh_date):
         df = df.sort_values(['_l', 'المسافة_من_المرجع', 'الرمز']).drop(columns='_l').reset_index(drop=True)
     return df
 
+ALERT_COLS = ['الرمز', 'السعر', 'RSI_الحالي', 'نوع_التنبيه', 'المسافة_من_المرجع', 'القاع_الاحمر', 'الاصفر_الادنى', 'الاصفر_الاعلى',
+              'نطاق_السعر', 'تنبيه_سيولة', 'متوسط_الحجم', 'مرجع_الدخول', 'ملاحظة']
+
+def tiers(ad):
+    """تقسيم التنبيهات حسب السعر؛ داخل كل قائمة: السيولة القوية أولاً ثم الضعيفة."""
+    if not len(ad): ad = pd.DataFrame(columns=ALERT_COLS)
+    return {'2_تنبيه_سعر_فوق_50': ad[ad['السعر'] > 50], '3_تنبيه_سعر_12_الى_50': ad[(ad['السعر'] >= 12) & (ad['السعر'] <= 50)],
+            '4_تنبيه_سعر_تحت_12': ad[ad['السعر'] < 12]}
+
 def cut6(d):
     y, m, dd = d.split('-'); m = int(m) - 6; y = int(y)
     if m < 1: m += 12; y -= 1
     return f'{y}-{m:02d}-{dd}'
 
-def write_xlsx(path, df, ad, last_date, notes=None):
+def write_xlsx(path, df, ad, last_date):
+    """ملف واحد بأربع قوائم: الرئيسية + تنبيهات (فوق 50$ | 12–50$ | تحت 12$)."""
     F = lambda **k: Font(name='Arial', size=10, **k)
-    wb = Workbook(); ws = wb.active; ws.title = 'ملاحظات_المنهجية'; ws.sheet_view.rightToLeft = True
-    notes = notes or [f'قائمة RSI — آخر يوم مكتمل: {last_date}', f'عدد الأسهم: {len(df):,} | التنبيهات: {len(ad):,}']
-    for i, t in enumerate(notes, 1):
-        c = ws.cell(i, 1, t); c.font = F(bold=(i == 1 or t.endswith(':'))); c.alignment = Alignment(wrap_text=True, vertical='top', horizontal='right')
-    ws.column_dimensions['A'].width = 150
+    wb = Workbook(); wb.remove(wb.active)
     fills = {k: 'FFE699' for k in ['الاصفر_ادنى', 'الاصفر_اعلى', 'الاصفر_الادنى', 'الاصفر_الاعلى']}
     fills.update({'القاع_الاحمر': 'F4B6B6', 'تاريخ_القاع_الاحمر': 'F4B6B6'})
     def sheet(name, d, widths):
@@ -69,6 +76,8 @@ def write_xlsx(path, df, ad, last_date, notes=None):
                 c = w.cell(i, j, v); c.font = F(); c.alignment = Alignment(horizontal='center')
         w.row_dimensions[1].height = 32; w.freeze_panes = 'B2'
         w.auto_filter.ref = f'A1:{get_column_letter(max(1, len(d.columns)))}{len(d) + 1}'
-    sheet('1_معدل_النجاح_المركزي', df, {'نوع_المنطقة_الحالية': 24, 'تاريخ_القاع_الاحمر': 14, 'متوسط_حجم_التداول': 16})
-    sheet('3_قسم_التنبيه', ad if len(ad) else pd.DataFrame(columns=['الرمز', 'السعر', 'RSI_الحالي', 'نوع_التنبيه']), {'نوع_التنبيه': 30, 'تنبيه_سيولة': 26, 'ملاحظة': 36})
+    sheet('1_القائمة_الرئيسية', df, {'نوع_المنطقة_الحالية': 24, 'تاريخ_القاع_الاحمر': 14, 'متوسط_حجم_التداول': 16})
+    t = tiers(ad)
+    for name, d in t.items(): sheet(name, d, {'نوع_التنبيه': 30, 'تنبيه_سيولة': 26, 'ملاحظة': 36})
     wb.save(path)
+    return {k: len(v) for k, v in t.items()}
