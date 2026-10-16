@@ -7,7 +7,7 @@ update-rsi.py — يعمل داخل daily-collection.yml بعد merge-and-cleanu
 import os, sys, json, glob, datetime as dt
 import requests
 from rsi_engine import advance, N, norm_symbol
-from rsi_report import rows, alerts, write_xlsx
+from rsi_report import rows, alerts, write_alerts_xlsx, write_list_xlsx
 
 ROOT = os.environ.get('REPO_ROOT', '.')
 P = lambda *a: os.path.join(ROOT, *a)
@@ -63,8 +63,11 @@ def tg_file(path, caption):
     with open(path, 'rb') as f:
         requests.post(f'https://api.telegram.org/bot{TOK}/sendDocument', data={'chat_id': CHAT, 'caption': caption[:1000]}, files={'document': f}, timeout=120)
 
+def months_between(a, b):   # 'YYYY-MM'
+    return (int(b[:4]) - int(a[:4])) * 12 + int(b[5:7]) - int(a[5:7])
+
 def main():
-    state = json.load(open(STATE, encoding='utf-8'))
+    state = json.load(open(STATE, encoding='utf-8')); meta = state.pop('__meta__', {})
     base = max(s['last_date'] for s in state.values())
     files = sorted(f for f in glob.glob(os.path.join(DAILY, '*.json')) if os.path.basename(f)[:-5] > base)
     print(f'آخر يوم في الحالة: {base} | أيام جديدة للدمج: {len(files)}')
@@ -76,14 +79,24 @@ def main():
         d = json.load(open(f, encoding='utf-8')); date = d['date']
         n, new = apply_day(state, date, d['records'], pcs if i == len(files) - 1 else None)   # previous_close متاح ليوم التشغيل فقط
         print(f'  {date}: دُمج {n} سهم، جديد {new}')
-    json.dump(state, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     last = max(s['last_date'] for s in state.values())
+    # القائمة المركزية: شهرياً (أول تشغيل في الشهر) أو عند الطلب SEND_LIST=1. أول تشغيل بلا سجل لا يرسلها (يُفترض أنها وصلتك).
+    every = int(os.environ.get('LIST_EVERY_MONTHS', '1')); month = last[:7]
+    send_list = os.environ.get('SEND_LIST') == '1' or ('list_month' in meta and months_between(meta['list_month'], month) >= every)
+    if send_list or 'list_month' not in meta: meta['list_month'] = month
+    save = dict(state); save['__meta__'] = meta
+    json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     universe, src = load_universe(files)
-    df = rows(state); ad = alerts(state, last, universe)
+    ad = alerts(state, last, universe)
     print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
-    out = P('rsi-list.xlsx'); cnt = write_xlsx(out, df, ad, last)
-    a50, a12, a0 = (cnt['2_تنبيه_سعر_فوق_50'], cnt['3_تنبيه_سعر_12_الى_50'], cnt['4_تنبيه_سعر_تحت_12'])
-    caption = f'📊 RSI {last}\nالقائمة الرئيسية: {len(df):,} سهم (كل السوق)\nالتنبيهات (NASDAQ + NYSE فقط) — فوق 50$: {a50} | 12–50$: {a12} | تحت 12$: {a0}'
-    print(caption); tg_file(out, caption)      # ملف واحد فقط، بلا رسائل نصية
+    out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, ad)
+    line = ' | '.join(f'{k}: {v}' for k, v in cnt.items())
+    caption = f'📊 تنبيهات RSI — {last}\nالمجموع: {len(ad)} (NASDAQ + NYSE)\n{line}'
+    print(caption)
+    if len(ad): tg_file(out, caption)
+    else: tg_text(f'📊 RSI {last} — لا توجد تنبيهات اليوم.')
+    if send_list:
+        df = rows(state); lst = P('rsi-list.xlsx'); write_list_xlsx(lst, df)
+        tg_file(lst, f'📋 القائمة المركزية — {last} ({len(df):,} سهم، كل السوق الأمريكي)')
 
 if __name__ == '__main__': main()
