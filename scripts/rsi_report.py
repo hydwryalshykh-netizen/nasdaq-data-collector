@@ -22,6 +22,14 @@ def rows(state):
     df['_k'] = df['نوع_المنطقة_الحالية'].map(lambda z: 0 if z.startswith('أحمر') else (1 if z == 'أصفر' else 2))
     return df.sort_values(['_k', 'RSI_الحالي', 'الرمز'], na_position='last').drop(columns='_k').reset_index(drop=True)
 
+TIERS = [(0, 5, '1_تنبيه_اقل_من_5', '<5$'), (5, 10, '2_تنبيه_5_الى_10', '5-10$'), (10, 20, '3_تنبيه_10_الى_20', '10-20$'),
+         (20, 50, '4_تنبيه_20_الى_50', '20-50$'), (50, 100, '5_تنبيه_50_الى_100', '50-100$'),
+         (100, 300, '6_تنبيه_100_الى_300', '100-300$'), (300, float('inf'), '7_تنبيه_300_فاكثر', '300$+')]
+
+def tier_label(p):
+    for lo, hi, _, lab in TIERS:
+        if lo <= p < hi: return lab
+
 def alerts(state, fresh_date, universe=None):
     """تنبيه فقط للأسهم المحدَّثة في يوم التداول الأخير (fresh_date)، وإن حُدّد universe فمن ضمنه فقط (NASDAQ+NYSE)."""
     out = []
@@ -34,7 +42,7 @@ def alerts(state, fresh_date, universe=None):
         out.append({'الرمز': t, 'السعر': round(p, 4 if p < 1 else 2), 'RSI_الحالي': round(s['rsi'], 2), 'نوع_التنبيه': a[0],
           'المسافة_من_المرجع': a[1], 'القاع_الاحمر': round(s['hist_low_rsi'], 2),
           'الاصفر_الادنى': round(yl, 2) if yl is not None else None, 'الاصفر_الاعلى': round(yh, 2) if yh is not None else None,
-          'نطاق_السعر': '<12$' if p < 12 else ('12-50$' if p <= 50 else '>50$'),
+          'نطاق_السعر': tier_label(p),
           'تنبيه_سيولة': '⚠️ سيولة ضعيفة - أهمية أقل' if s['median_volume'] < 50000 else '',
           'متوسط_الحجم': int(s['median_volume']), 'مرجع_الدخول': a[2],
           'ملاحظة': ('تقسيم/اندماج مُعدَّل: ' + ' ، '.join(sp)) if sp else ''})
@@ -48,36 +56,41 @@ ALERT_COLS = ['الرمز', 'السعر', 'RSI_الحالي', 'نوع_التنب
               'نطاق_السعر', 'تنبيه_سيولة', 'متوسط_الحجم', 'مرجع_الدخول', 'ملاحظة']
 
 def tiers(ad):
-    """تقسيم التنبيهات حسب السعر؛ داخل كل قائمة: السيولة القوية أولاً ثم الضعيفة."""
+    """سبع قوائم حسب السعر؛ داخل كل قائمة: السيولة القوية أولاً ثم الضعيفة (الترتيب محفوظ من alerts)."""
     if not len(ad): ad = pd.DataFrame(columns=ALERT_COLS)
-    return {'2_تنبيه_سعر_فوق_50': ad[ad['السعر'] > 50], '3_تنبيه_سعر_12_الى_50': ad[(ad['السعر'] >= 12) & (ad['السعر'] <= 50)],
-            '4_تنبيه_سعر_تحت_12': ad[ad['السعر'] < 12]}
+    return {name: ad[(ad['السعر'] >= lo) & (ad['السعر'] < hi)] for lo, hi, name, _ in TIERS}
 
 def cut6(d):
     y, m, dd = d.split('-'); m = int(m) - 6; y = int(y)
     if m < 1: m += 12; y -= 1
     return f'{y}-{m:02d}-{dd}'
 
-def write_xlsx(path, df, ad, last_date):
-    """ملف واحد بأربع قوائم: الرئيسية + تنبيهات (فوق 50$ | 12–50$ | تحت 12$)."""
+FILLS = {k: 'FFE699' for k in ['الاصفر_ادنى', 'الاصفر_اعلى', 'الاصفر_الادنى', 'الاصفر_الاعلى']}
+FILLS.update({'القاع_الاحمر': 'F4B6B6', 'تاريخ_القاع_الاحمر': 'F4B6B6'})
+
+def _sheet(wb, name, d, widths):
     F = lambda **k: Font(name='Arial', size=10, **k)
-    wb = Workbook(); wb.remove(wb.active)
-    fills = {k: 'FFE699' for k in ['الاصفر_ادنى', 'الاصفر_اعلى', 'الاصفر_الادنى', 'الاصفر_الاعلى']}
-    fills.update({'القاع_الاحمر': 'F4B6B6', 'تاريخ_القاع_الاحمر': 'F4B6B6'})
-    def sheet(name, d, widths):
-        w = wb.create_sheet(name); w.sheet_view.rightToLeft = True
-        for j, col in enumerate(d.columns, 1):
-            c = w.cell(1, j, col); c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            c.fill = PatternFill('solid', fgColor=fills.get(col, '1F3864')); c.font = F(bold=True, color='000000' if col in fills else 'FFFFFF')
-            w.column_dimensions[get_column_letter(j)].width = widths.get(col, 14)
-        for i, row in enumerate(d.itertuples(index=False), 2):
-            for j, v in enumerate(row, 1):
-                if pd.isna(v): v = None
-                c = w.cell(i, j, v); c.font = F(); c.alignment = Alignment(horizontal='center')
-        w.row_dimensions[1].height = 32; w.freeze_panes = 'B2'
-        w.auto_filter.ref = f'A1:{get_column_letter(max(1, len(d.columns)))}{len(d) + 1}'
-    sheet('1_القائمة_الرئيسية', df, {'نوع_المنطقة_الحالية': 24, 'تاريخ_القاع_الاحمر': 14, 'متوسط_حجم_التداول': 16})
-    t = tiers(ad)
-    for name, d in t.items(): sheet(name, d, {'نوع_التنبيه': 30, 'تنبيه_سيولة': 26, 'ملاحظة': 36})
+    w = wb.create_sheet(name); w.sheet_view.rightToLeft = True
+    for j, col in enumerate(d.columns, 1):
+        c = w.cell(1, j, col); c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.fill = PatternFill('solid', fgColor=FILLS.get(col, '1F3864')); c.font = F(bold=True, color='000000' if col in FILLS else 'FFFFFF')
+        w.column_dimensions[get_column_letter(j)].width = widths.get(col, 14)
+    for i, row in enumerate(d.itertuples(index=False), 2):
+        for j, v in enumerate(row, 1):
+            if pd.isna(v): v = None
+            c = w.cell(i, j, v); c.font = F(); c.alignment = Alignment(horizontal='center')
+    w.row_dimensions[1].height = 32; w.freeze_panes = 'B2'
+    w.auto_filter.ref = f'A1:{get_column_letter(max(1, len(d.columns)))}{len(d) + 1}'
+
+def write_alerts_xlsx(path, ad):
+    """ملف التنبيهات اليومي فقط: سبع قوائم حسب السعر. يرجع عدد التنبيهات لكل قائمة."""
+    wb = Workbook(); wb.remove(wb.active); t = tiers(ad)
+    for name, d in t.items(): _sheet(wb, name, d, {'نوع_التنبيه': 30, 'تنبيه_سيولة': 26, 'ملاحظة': 36})
     wb.save(path)
-    return {k: len(v) for k, v in t.items()}
+    return {lab: len(t[name]) for _, _, name, lab in TIERS}
+
+def write_list_xlsx(path, df):
+    """القائمة المركزية (كل السوق) — تُرسل شهرياً."""
+    wb = Workbook(); wb.remove(wb.active)
+    _sheet(wb, '1_القائمة_الرئيسية', df, {'نوع_المنطقة_الحالية': 24, 'تاريخ_القاع_الاحمر': 14, 'متوسط_حجم_التداول': 16})
+    wb.save(path)
