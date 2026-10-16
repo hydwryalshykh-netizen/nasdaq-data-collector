@@ -7,6 +7,10 @@ on:
         description: "هل تحفظ rsi-state.json في المستودع؟ (false = اختبار فقط، true = حفظ)"
         required: true
         default: "false"
+      send_list:
+        description: "هل ترسل القائمة المركزية الآن أيضاً؟ (true/false)"
+        required: true
+        default: "false"
 
 permissions:
   contents: write
@@ -30,6 +34,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_LIST: ${{ inputs.send_list == 'true' && '1' || '0' }}
         run: python scripts/update-rsi.py
 
       - name: حفظ rsi-state.json (فقط إذا save = true)
