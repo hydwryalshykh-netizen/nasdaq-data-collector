@@ -101,14 +101,14 @@ def main():
     every = int(os.environ.get('LIST_EVERY_MONTHS', '1')); month = last[:7]
     send_list = os.environ.get('SEND_LIST') == '1' or ('list_month' in meta and months_between(meta['list_month'], month) >= every)
     if send_list or 'list_month' not in meta: meta['list_month'] = month
-    save = dict(state); save['__meta__'] = meta
-    json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     universe, src = load_universe(files)
     live = {t: s for t, s in state.items() if 'pending' not in s}
     print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
     no_zone = sum(1 for t, s in live.items() if (not universe or t in universe) and zone(s)[0] is None)
     print(f'أسهم داخل النطاق بلا منطقة صفراء (لا تدخل الأقسام 4–7): {no_zone}')
     results, failed = run_all_engines(state, universe, last)
+    save = dict(state); save['__meta__'] = meta
+    json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, results)
     total = sum(v for v in cnt.values() if v)
     line = ' | '.join(f'{k}: {"❌" if v is None else v}' for k, v in cnt.items())

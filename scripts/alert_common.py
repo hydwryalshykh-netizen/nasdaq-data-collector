@@ -12,9 +12,21 @@ def _cut6(d):
     if m < 1: m += 12; y -= 1
     return f'{y}-{m:02d}-{dd}'
 
+def _threshold(m, red, yl, yh):
+    """أعلى RSI يتحقق عنده شرط المحرك (الشرط دائماً x ≤ حد) — بالتنصيف، فلا نحتاج تعديل ملفات المحركات."""
+    lo, hi = -1.0, 101.0
+    if not m.check(lo, red, yl, yh): return None
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if m.check(mid, red, yl, yh): lo = mid
+        else: hi = mid
+    return lo
+
 def run_engine(modname, state, universe, last_date):
     """يستورد المحرك بالاسم ويمرّر عليه أسهم نطاقه السعري. يرجع (NAME, TIER, DataFrame).
-    الأسهم تُقيَّم على آخر RSI معروف: السهم يبقى في القائمة ما دام شرطه قائماً (ولو لم يتداول اليوم) ويخرج حين يرتفع فوق شرطه."""
+    السهم يُقيَّم على آخر RSI معروف ويبقى ما دام شرطه قائماً (ولو لم يتداول اليوم).
+    قاعدة الاستمرار: عند التنبيه نحفظ في الحالة s['alert_exit'] = أعلى RSI دخل عنده. فإذا عبر السعر إلى قسم آخر شرطه أضيق
+    يبقى السهم ما دام RSI ≤ ذلك المستوى، ولا يخرج إلا حين يرتفع RSI فوقه."""
     m = importlib.import_module(modname)
     cut = _cut6(last_date); rows = []
     for sym, s in state.items():
@@ -23,9 +35,18 @@ def run_engine(modname, state, universe, last_date):
         p = s['last_close']
         if not (m.LO <= p < m.HI): continue
         yl, yh = zone(s)
-        hit = m.check(s['rsi'], s.get('hist_low_rsi'), yl, yh)
-        if not hit: continue
-        label, dist = hit
+        x = s['rsi']; red = s.get('hist_low_rsi'); held = s.get('alert_exit')
+        hit = m.check(x, red, yl, yh)
+        if hit:
+            T = _threshold(m, red, yl, yh)
+            s['alert_exit'] = max(T, held) if (held is not None and x <= held and T is not None) else T
+            label, dist = hit
+        elif held is not None and x <= held:
+            ref = yl if yl is not None else (red if red is not None else 0.0)
+            label, dist = ('استمرار — دخل سابقاً ولم يرتفع بعد', round(x - ref, 2))
+        else:
+            if held is not None: s.pop('alert_exit', None)      # ارتفع فوق مستواه → خرج
+            continue
         sp = [f'{d} ×{r}' for d, r in s.get('splits', []) if d >= cut]
         rows.append({'الرمز': sym, 'السعر': round(p, 4 if p < 1 else 2), 'RSI_الحالي': round(s['rsi'], 2), 'نوع_التنبيه': label,
                      'المسافة_من_المرجع': dist, 'القاع_الاحمر': round(s['hist_low_rsi'], 2) if s.get('hist_low_rsi') is not None else None,
