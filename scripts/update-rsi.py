@@ -105,7 +105,7 @@ def main():
     live = {t: s for t, s in state.items() if 'pending' not in s}
     print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
     no_zone = sum(1 for t, s in live.items() if (not universe or t in universe) and zone(s)[0] is None)
-    print(f'أسهم داخل النطاق بلا منطقة صفراء (لا تدخل الأقسام 4–7): {no_zone}')
+    print(f'أسهم داخل النطاق بلا منطقة صفراء (تُقيَّم بمنطقة تقديرية في الأقسام 4–7): {no_zone}')
     results, failed = run_all_engines(state, universe, last)
     save = dict(state); save['__meta__'] = meta
     json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))

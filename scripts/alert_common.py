@@ -6,6 +6,8 @@ from rsi_engine import zone
 COLS = ['الرمز', 'السعر', 'RSI_الحالي', 'نوع_التنبيه', 'المسافة_من_المرجع', 'القاع_الاحمر', 'الاصفر_الادنى', 'الاصفر_الاعلى',
         'نطاق_السعر', 'تنبيه_سيولة', 'متوسط_الحجم', 'آخر_يوم_تداول', 'ملاحظة']
 WEAK_VOLUME = 50000
+# أسهم بأقل من 3 لمسات (إدراج حديث مثل SNDK) لا منطقة صفراء لها؛ نقيّمها بمنطقة تقديرية = وسيط مناطق كل الأسهم (حالة 2026-10-01)
+DEFAULT_YL, DEFAULT_YH = 24.4, 33.9
 
 def _cut6(d):
     y, m, dd = d.split('-'); m = int(m) - 6; y = int(y)
@@ -35,6 +37,8 @@ def run_engine(modname, state, universe, last_date):
         p = s['last_close']
         if not (m.LO <= p < m.HI): continue
         yl, yh = zone(s)
+        est = yl is None
+        if est: yl, yh = DEFAULT_YL, DEFAULT_YH
         x = s['rsi']; red = s.get('hist_low_rsi'); held = s.get('alert_exit')
         hit = m.check(x, red, yl, yh)
         if hit:
@@ -48,12 +52,13 @@ def run_engine(modname, state, universe, last_date):
             if held is not None: s.pop('alert_exit', None)      # ارتفع فوق مستواه → خرج
             continue
         sp = [f'{d} ×{r}' for d, r in s.get('splits', []) if d >= cut]
+        est_note = 'منطقة صفراء تقديرية (أقل من 3 لمسات)' if (est and not label.startswith('قاع أحمر')) else ''
         rows.append({'الرمز': sym, 'السعر': round(p, 4 if p < 1 else 2), 'RSI_الحالي': round(s['rsi'], 2), 'نوع_التنبيه': label,
                      'المسافة_من_المرجع': dist, 'القاع_الاحمر': round(s['hist_low_rsi'], 2) if s.get('hist_low_rsi') is not None else None,
                      'الاصفر_الادنى': round(yl, 2) if yl is not None else None, 'الاصفر_الاعلى': round(yh, 2) if yh is not None else None,
                      'نطاق_السعر': m.TIER, 'تنبيه_سيولة': '⚠️ سيولة ضعيفة - أهمية أقل' if s['median_volume'] < WEAK_VOLUME else '',
                      'متوسط_الحجم': int(s['median_volume']), 'آخر_يوم_تداول': s['last_date'],
-                     'ملاحظة': ('تقسيم/اندماج مُعدَّل: ' + ' ، '.join(sp)) if sp else ''})
+                     'ملاحظة': ' | '.join(x_ for x_ in [est_note, ('تقسيم/اندماج مُعدَّل: ' + ' ، '.join(sp)) if sp else ''] if x_)})
     df = pd.DataFrame(rows, columns=COLS)
     if len(df):
         df['_l'] = df['تنبيه_سيولة'].ne('').astype(int)
