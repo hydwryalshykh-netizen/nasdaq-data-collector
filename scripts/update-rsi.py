@@ -7,9 +7,7 @@ update-rsi.py — يعمل داخل daily-collection.yml بعد merge-and-cleanu
 import os, sys, json, glob, datetime as dt
 import requests
 from rsi_engine import advance, N, norm_symbol, zone
-from rsi_report import rows, write_alerts_xlsx, write_list_xlsx
-from alert_common import run_engine, COLS
-import pandas as pd
+from rsi_report import rows, write_list_xlsx
 
 ROOT = os.environ.get('REPO_ROOT', '.')
 P = lambda *a: os.path.join(ROOT, *a)
@@ -71,6 +69,9 @@ ENGINES = [('alert_s1', '1_تنبيه_اقل_من_5', '<5$'), ('alert_s2', '2_ت
            ('alert_s6', '6_تنبيه_100_الى_300', '100-300$'), ('alert_s7', '7_تنبيه_300_فاكثر', '300$+')]
 
 def run_all_engines(state, universe, last):
+    """المحركات السبعة القديمة (اختيارية: إن حُذفت ملفاتها يُرفع ImportError فيتخطاها main دون أن يتأثر شيء)."""
+    from alert_common import run_engine, COLS
+    import pandas as pd
     results, failed = [], []
     for mod, name, tier in ENGINES:
         try:
@@ -78,13 +79,6 @@ def run_all_engines(state, universe, last):
         except Exception as e:
             err = f'{mod}.py — {type(e).__name__}: {e}'; failed.append(err)
             results.append((name, tier, pd.DataFrame(columns=COLS), err))
-    # القسم 8: قائمة منفردة دقيقة (سعر ≥ 50$ وحجم ≥ 1M) — محرك مستقل بطبقة تحقق
-    try:
-        import importlib; m8 = importlib.import_module('alert_s8')
-        results.append((m8.NAME, m8.TIER, m8.run(state, universe, last, DAILY), None))
-    except Exception as e:
-        err = f'alert_s8.py — {type(e).__name__}: {e}'; failed.append(err)
-        results.append(('8_دقيقة_50$_فاكثر_حجم_1M', '50$+ حجم≥1M', pd.DataFrame(columns=COLS), err))
     return results, failed
 
 def months_between(a, b):   # 'YYYY-MM'
@@ -113,21 +107,40 @@ def main():
     print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
     no_zone = sum(1 for t, s in live.items() if (not universe or t in universe) and zone(s)[0] is None)
     print(f'أسهم داخل النطاق بلا منطقة صفراء (تُقيَّم بمنطقة تقديرية في الأقسام 4–7): {no_zone}')
-    results, failed = run_all_engines(state, universe, last)
+    # --- (أ) المحركات السبعة القديمة: اختيارية
+    try:
+        results, failed = run_all_engines(state, universe, last); legacy = True
+    except ImportError as e:
+        results, failed, legacy = [], [], False; print(f'المحركات السبعة القديمة غير موجودة — تم تخطيها ({e})')
     save = dict(state); save['__meta__'] = meta
     json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
-    out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, results)
-    total = sum(len(r[2]) for r in results[:7] if not r[3])          # الأقسام 1–7 فقط (القسم 8 قائمة منفردة قد تكرر أسهماً)
-    line = ' | '.join(f'{k}: {"❌" if v is None else v}' for k, v in cnt.items())
-    caption = f'📊 تنبيهات RSI — {last}\nالمجموع (الأقسام 1–7): {total} (NASDAQ + NYSE)\n{line}'
+    if legacy:
+        from rsi_report import write_alerts_xlsx
+        out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, results)
+        total = sum(len(r[2]) for r in results if not r[3])
+        line = ' | '.join(f'{k}: {"❌" if v is None else v}' for k, v in cnt.items())
+        caption = f'📊 تنبيهات RSI — {last}\nالمجموع: {total} (NASDAQ + NYSE)\n{line}'
+        if failed: caption += '\n❌ محركات فشلت:\n' + '\n'.join(failed)
+        print(caption)
+        if total or failed: tg_file(out, caption)
+        else: tg_text(f'📊 RSI {last} — لا توجد تنبيهات اليوم.')
+    # --- (ب) قائمة السيولة المستقلة (متوسط حجم ≥ 1M): ملف خاص بقسمين
     try:
-        import alert_s8; miss = alert_s8.INFO.get('missing_days') or []
-        if miss: caption += '\n⚠️ أيام ناقصة في daily-data (تُحرِّف RSI قليلاً): ' + ' ، '.join(miss[-5:])
-    except Exception: pass
-    if failed: caption += '\n❌ محركات فشلت:\n' + '\n'.join(failed)
-    print(caption)
-    if total or failed: tg_file(out, caption)
-    else: tg_text(f'📊 RSI {last} — لا توجد تنبيهات اليوم.')
+        import alert_liquid
+    except ImportError:
+        alert_liquid = None; print('alert_liquid.py غير موجود — تم تخطي قائمة السيولة')
+    if alert_liquid:
+        try:
+            df_all, df_al = alert_liquid.run(state, universe, last, DAILY)
+            lp = P('rsi-liquid.xlsx'); alert_liquid.write_xlsx(lp, df_all, df_al)
+            lv = df_al['درجة_التأكيد'].value_counts().to_dict() if len(df_al) else {}
+            cap = (f'📊 قائمة السيولة (متوسط حجم ≥ 1M) — {last}\nالأسهم السائلة: {len(df_all):,}\n'
+                   f'أصفر أدنى - اقتراب (≤5 نقاط): {len(df_al)}' + (' — ' + ' | '.join(f'{k}: {v}' for k, v in lv.items()) if lv else ''))
+            miss = alert_liquid.INFO.get('missing_days') or []
+            if miss: cap += '\n⚠️ أيام ناقصة في daily-data (تُحرِّف RSI قليلاً): ' + ' ، '.join(miss[-5:])
+            print(cap); tg_file(lp, cap)
+        except Exception as e:
+            msg = f'❌ فشلت قائمة السيولة: alert_liquid.py — {type(e).__name__}: {e}'; print(msg); tg_text(msg)
     if send_list:
         df = rows(state); lst = P('rsi-list.xlsx'); write_list_xlsx(lst, df)
         tg_file(lst, f'📋 القائمة المركزية — {last} ({len(df):,} سهم، كل السوق الأمريكي)')
