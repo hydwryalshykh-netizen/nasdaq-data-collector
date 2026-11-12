@@ -78,6 +78,13 @@ def run_all_engines(state, universe, last):
         except Exception as e:
             err = f'{mod}.py — {type(e).__name__}: {e}'; failed.append(err)
             results.append((name, tier, pd.DataFrame(columns=COLS), err))
+    # القسم 8: قائمة منفردة دقيقة (سعر ≥ 50$ وحجم ≥ 1M) — محرك مستقل بطبقة تحقق
+    try:
+        import importlib; m8 = importlib.import_module('alert_s8')
+        results.append((m8.NAME, m8.TIER, m8.run(state, universe, last, DAILY), None))
+    except Exception as e:
+        err = f'alert_s8.py — {type(e).__name__}: {e}'; failed.append(err)
+        results.append(('8_دقيقة_50$_فاكثر_حجم_1M', '50$+ حجم≥1M', pd.DataFrame(columns=COLS), err))
     return results, failed
 
 def months_between(a, b):   # 'YYYY-MM'
@@ -110,9 +117,13 @@ def main():
     save = dict(state); save['__meta__'] = meta
     json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, results)
-    total = sum(v for v in cnt.values() if v)
+    total = sum(len(r[2]) for r in results[:7] if not r[3])          # الأقسام 1–7 فقط (القسم 8 قائمة منفردة قد تكرر أسهماً)
     line = ' | '.join(f'{k}: {"❌" if v is None else v}' for k, v in cnt.items())
-    caption = f'📊 تنبيهات RSI — {last}\nالمجموع: {total} (NASDAQ + NYSE)\n{line}'
+    caption = f'📊 تنبيهات RSI — {last}\nالمجموع (الأقسام 1–7): {total} (NASDAQ + NYSE)\n{line}'
+    try:
+        import alert_s8; miss = alert_s8.INFO.get('missing_days') or []
+        if miss: caption += '\n⚠️ أيام ناقصة في daily-data (تُحرِّف RSI قليلاً): ' + ' ، '.join(miss[-5:])
+    except Exception: pass
     if failed: caption += '\n❌ محركات فشلت:\n' + '\n'.join(failed)
     print(caption)
     if total or failed: tg_file(out, caption)
