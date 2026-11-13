@@ -112,8 +112,8 @@ def main():
     try:
         import alert_liquid
         try:
-            df_all, df_al, df_ex = alert_liquid.run(state, universe, last, DAILY)
-            liq = (df_all, df_al, df_ex); liquid_set = alert_liquid.LIQUID_SET
+            df_all, df_al = alert_liquid.run(state, universe, last, DAILY)
+            liq = (df_all, df_al); liquid_set = alert_liquid.LIQUID_SET
         except Exception as e:
             liq_err = f'❌ فشلت قائمة السيولة: alert_liquid.py — {type(e).__name__}: {e}'; print(liq_err)
     except ImportError:
@@ -141,12 +141,12 @@ def main():
     # --- (ج) إرسال ملف قائمة السيولة
     if liq_err: tg_text(liq_err)
     if liq is not None:
-        df_all, df_al, df_ex = liq
+        df_all, df_al = liq
         try:
-            lp = P('rsi-liquid.xlsx'); alert_liquid.write_xlsx(lp, df_all, df_al, df_ex)
+            lp = P('rsi-liquid.xlsx'); alert_liquid.write_xlsx(lp, df_all, df_al)
             lv = df_al['درجة_التأكيد'].value_counts().to_dict() if len(df_al) else {}
-            cap = (f'📊 قائمة السيولة (متوسط ≥ 1M و5 من آخر 7 أيام ≥ 1M) — {last}\nالأسهم القوية التداول: {len(df_all):,} | استُبعد بسبب طفرة يوم واحد: {len(df_ex):,}\n'
-                   f'أصفر أدنى - اقتراب (≤5 نقاط): {len(df_al)}' + (' — ' + ' | '.join(f'{k}: {v}' for k, v in lv.items()) if lv else ''))
+            cap = (f'📊 قائمة السيولة (متوسط ≥ 1M و5 من آخر 7 أيام ≥ 1M) — {last}\nالأسهم القوية التداول: {len(df_all):,}\n'
+                   f'أصفر أدنى - اقتراب (≤5 نقاط) أو أقل: {len(df_al)}' + (' — ' + ' | '.join(f'{k}: {v}' for k, v in lv.items()) if lv else ''))
             miss = alert_liquid.INFO.get('missing_days') or []
             if miss: cap += '\n⚠️ أيام ناقصة في daily-data (تُحرِّف RSI قليلاً): ' + ' ، '.join(miss[-5:])
             print(cap); tg_file(lp, cap)
