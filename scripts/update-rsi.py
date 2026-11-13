@@ -107,11 +107,24 @@ def main():
     print(f'نطاق التنبيهات: {len(universe) if universe else "الكل"} سهم من {src} | أسهم القائمة داخله: {sum(1 for t in state if universe and t in universe)}')
     no_zone = sum(1 for t, s in live.items() if (not universe or t in universe) and zone(s)[0] is None)
     print(f'أسهم داخل النطاق بلا منطقة صفراء (تُقيَّم بمنطقة تقديرية في الأقسام 4–7): {no_zone}')
-    # --- (أ) المحركات السبعة القديمة: اختيارية
+    # --- (أ) قائمة السيولة المستقلة (حجم قوي): تُحسب أولاً لأن فلترها يُطبَّق أيضاً على المحركات السبعة
+    liq = None; liq_err = None; liquid_set = None
+    try:
+        import alert_liquid
+        try:
+            df_all, df_al, df_ex = alert_liquid.run(state, universe, last, DAILY)
+            liq = (df_all, df_al, df_ex); liquid_set = alert_liquid.LIQUID_SET
+        except Exception as e:
+            liq_err = f'❌ فشلت قائمة السيولة: alert_liquid.py — {type(e).__name__}: {e}'; print(liq_err)
+    except ImportError:
+        alert_liquid = None; print('alert_liquid.py غير موجود — تم تخطي قائمة السيولة وفلتر الحجم')
+    # --- (ب) المحركات السبعة القديمة: اختيارية، وتُصفّى بشرط الحجم القوي (متوسط ≥ 1M وليس طفرة يوم واحد)
     try:
         results, failed = run_all_engines(state, universe, last); legacy = True
     except ImportError as e:
         results, failed, legacy = [], [], False; print(f'المحركات السبعة القديمة غير موجودة — تم تخطيها ({e})')
+    if legacy and liquid_set is not None:
+        results = [(n, t, (df[df['الرمز'].isin(liquid_set)].reset_index(drop=True) if not err else df), err) for n, t, df, err in results]
     save = dict(state); save['__meta__'] = meta
     json.dump(save, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
     if legacy:
@@ -119,28 +132,26 @@ def main():
         out = P('rsi-alerts.xlsx'); cnt = write_alerts_xlsx(out, results)
         total = sum(len(r[2]) for r in results if not r[3])
         line = ' | '.join(f'{k}: {"❌" if v is None else v}' for k, v in cnt.items())
-        caption = f'📊 تنبيهات RSI — {last}\nالمجموع: {total} (NASDAQ + NYSE)\n{line}'
+        flt = ' (حجم قوي فقط: متوسط ≥ 1M و5 من آخر 7 أيام ≥ 1M)' if liquid_set is not None else ' ⚠️ فلتر الحجم غير مطبَّق'
+        caption = f'📊 تنبيهات RSI — {last}\nالمجموع: {total} (NASDAQ + NYSE){flt}\n{line}'
         if failed: caption += '\n❌ محركات فشلت:\n' + '\n'.join(failed)
         print(caption)
         if total or failed: tg_file(out, caption)
-        else: tg_text(f'📊 RSI {last} — لا توجد تنبيهات اليوم.')
-    # --- (ب) قائمة السيولة المستقلة (متوسط حجم ≥ 1M): ملف خاص بقسمين
-    try:
-        import alert_liquid
-    except ImportError:
-        alert_liquid = None; print('alert_liquid.py غير موجود — تم تخطي قائمة السيولة')
-    if alert_liquid:
+        else: tg_text(f'📊 RSI {last} — لا توجد تنبيهات اليوم.{flt}')
+    # --- (ج) إرسال ملف قائمة السيولة
+    if liq_err: tg_text(liq_err)
+    if liq is not None:
+        df_all, df_al, df_ex = liq
         try:
-            df_all, df_al = alert_liquid.run(state, universe, last, DAILY)
-            lp = P('rsi-liquid.xlsx'); alert_liquid.write_xlsx(lp, df_all, df_al)
+            lp = P('rsi-liquid.xlsx'); alert_liquid.write_xlsx(lp, df_all, df_al, df_ex)
             lv = df_al['درجة_التأكيد'].value_counts().to_dict() if len(df_al) else {}
-            cap = (f'📊 قائمة السيولة (متوسط حجم ≥ 1M) — {last}\nالأسهم السائلة: {len(df_all):,}\n'
+            cap = (f'📊 قائمة السيولة (متوسط ≥ 1M و5 من آخر 7 أيام ≥ 1M) — {last}\nالأسهم القوية التداول: {len(df_all):,} | استُبعد بسبب طفرة يوم واحد: {len(df_ex):,}\n'
                    f'أصفر أدنى - اقتراب (≤5 نقاط): {len(df_al)}' + (' — ' + ' | '.join(f'{k}: {v}' for k, v in lv.items()) if lv else ''))
             miss = alert_liquid.INFO.get('missing_days') or []
             if miss: cap += '\n⚠️ أيام ناقصة في daily-data (تُحرِّف RSI قليلاً): ' + ' ، '.join(miss[-5:])
             print(cap); tg_file(lp, cap)
         except Exception as e:
-            msg = f'❌ فشلت قائمة السيولة: alert_liquid.py — {type(e).__name__}: {e}'; print(msg); tg_text(msg)
+            msg = f'❌ فشلت كتابة قائمة السيولة: alert_liquid.py — {type(e).__name__}: {e}'; print(msg); tg_text(msg)
     if send_list:
         df = rows(state); lst = P('rsi-list.xlsx'); write_list_xlsx(lst, df)
         tg_file(lst, f'📋 القائمة المركزية — {last} ({len(df):,} سهم، كل السوق الأمريكي)')

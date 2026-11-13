@@ -1,8 +1,10 @@
 """
 قائمة السيولة — محرك مستقل تماماً (لا يعتمد على المحركات السبعة ولا على alert_common).
-الشرط الوحيد لدخول القائمة: متوسط حجم التداول ≥ 1,000,000 (بلا شرط سعر). ملف واحد بقسمين:
+شرط الدخول (بلا شرط سعر): (أ) متوسط حجم آخر 60 يوماً ≥ 1,000,000 **و** (ب) فحص ثانٍ ضد الطفرات: الحجم ≥ 1,000,000 في 5 أيام على الأقل من آخر 7 أيام تداول
+(لأن يوماً واحداً بمئة مليون سهم يرفع المتوسط وحده ولا يعني تداولاً قوياً). ملف واحد بثلاثة أقسام:
   1) كل الأسهم السائلة (القائمة الكاملة بمعلوماتها)
   2) منها: من يحقق RSI ≤ الأصفر الأدنى + 5  («أصفر أدنى - اقتراب (≤5 نقاط)»)
+  3) مستبعدة بسبب طفرة/تجميع يوم واحد (متوسطها ≥ 1M لكن تداولها الفعلي ضعيف) مع السبب — للشفافية فقط
 بلا ذاكرة مخفية: القسم 2 = من يحقق الشرط اليوم فقط، وكل صف يُفحص من أعمدته.
 RSI من مصدرين: الحالة + إعادة حساب مستقلة من إغلاقات daily-data. يدخل القسم 2 إن حقق الشرط أيٌّ منهما،
 وعمود «درجة_التأكيد»: مؤكد (المصدران) / دقّق (مصدر واحد فقط) / مصدر واحد (التحقق غير ممكن).
@@ -13,8 +15,12 @@ import numpy as np
 import pandas as pd
 from rsi_engine import zone, norm_symbol
 
-SHEET_ALL = '1_كل_الأسهم_حجم_1M'; SHEET_ALERT = '2_اصفر_ادنى_اقتراب_5'
+SHEET_ALL = '1_كل_الأسهم_حجم_1M'; SHEET_ALERT = '2_اصفر_ادنى_اقتراب_5'; SHEET_EXCL = '3_استبعدت_طفرة_حجم'
 MIN_AVG_VOL = 1_000_000
+RECENT_DAYS = 7            # فحص الطفرات: آخر 7 أيام تداول
+MIN_DAYS_OVER = 5          # يجب أن يكون الحجم ≥ 1M في 5 منها على الأقل
+SPIKE_SHARE = 0.25         # أكبر يوم يشكل ≥ 25% من مجموع 60 يوماً = طفرة (للتنبيه في الملاحظة)
+LIQUID_SET = None          # يملؤه run(): الأسهم القوية التداول (يستعملها المنسّق لتصفية المحركات القديمة)
 NEAR = 5.0                 # RSI ≤ الأصفر الأدنى + 5
 VOL_DAYS = 60; MIN_VOL_DAYS = 20
 MAX_FILES = 320
@@ -25,9 +31,10 @@ DEFAULT_YL, DEFAULT_YH = 24.4, 33.9
 HOLIDAYS = {'2025-07-04', '2025-09-01', '2025-11-27', '2025-12-25', '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03',
             '2026-05-25', '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25'}
 COLS_ALL = ['الرمز', 'السعر', 'RSI_الحالي', 'القاع_الاحمر', 'الاصفر_الادنى', 'الاصفر_الاعلى', 'المسافة_من_الاصفر_الادنى',
-            'متوسط_حجم_60_يوم', 'RSI_تحقق', 'فرق_التحقق', 'حالة_المصدرين', 'آخر_يوم_تداول', 'ملاحظة']
+            'متوسط_حجم_60_يوم', 'أيام_فوق_مليون_من_7', 'وسيط_حجم_7_ايام', 'RSI_تحقق', 'فرق_التحقق', 'حالة_المصدرين', 'آخر_يوم_تداول', 'ملاحظة']
 COLS_ALERT = ['الرمز', 'السعر', 'RSI_الحالي', 'نوع_التنبيه', 'المسافة_من_الاصفر_الادنى', 'القاع_الاحمر', 'الاصفر_الادنى', 'الاصفر_الاعلى',
-              'متوسط_حجم_60_يوم', 'RSI_تحقق', 'فرق_التحقق', 'درجة_التأكيد', 'آخر_يوم_تداول', 'ملاحظة']
+              'متوسط_حجم_60_يوم', 'أيام_فوق_مليون_من_7', 'وسيط_حجم_7_ايام', 'RSI_تحقق', 'فرق_التحقق', 'درجة_التأكيد', 'آخر_يوم_تداول', 'ملاحظة']
+COLS_EXCL = ['الرمز', 'السعر', 'متوسط_حجم_60_يوم', 'أيام_فوق_مليون_من_7', 'وسيط_حجم_7_ايام', 'نسبة_اكبر_يوم_من_60', 'السبب']
 INFO = {}
 
 def _rsi(closes, n=14):
@@ -60,12 +67,12 @@ def _num(x):
     except (TypeError, ValueError): return None
 
 def run(state, universe, last_date, daily_dir):
-    """يرجع (DataFrame كل الأسهم السائلة، DataFrame التنبيه)."""
+    """يرجع (DataFrame كل الأسهم السائلة، DataFrame التنبيه، DataFrame المستبعدة بسبب الطفرة)."""
     files = sorted(glob.glob(os.path.join(daily_dir, '*.json')))[-MAX_FILES:]
     inuni = lambda t: universe is None or t in universe
     # --- مرور 1: آخر 60 ملفاً → أحجام وإغلاقات كل الأسهم (لتحديد السائلة)
     recent_files, older_files = files[-VOL_DAYS:], files[:-VOL_DAYS]
-    vols, closes_recent, dates = {}, {}, []
+    vols, closes_recent, dates, vbd = {}, {}, [], {}
     for f in recent_files:
         date, recs = _read(f)
         if date is None: continue
@@ -77,14 +84,29 @@ def run(state, universe, last_date, daily_dir):
             if c and c > 0:
                 closes_recent.setdefault(k, []).append((date, c))
                 if v > 0: vols.setdefault(k, []).append(v)
-    # --- السائلة: متوسط ≥ 1M (أو من الحالة إن قلّت أيام daily-data)
-    liquid, avgv, vnote = set(), {}, {}
+            vbd.setdefault(k, {})[date] = v
+    # --- السائلة: (أ) متوسط 60 يوماً ≥ 1M  (ب) 5 من آخر 7 أيام ≥ 1M  — وإلا تُسجَّل في «المستبعدة» مع السبب
+    last7 = sorted(set(dates))[-RECENT_DAYS:]; can7 = len(last7) >= RECENT_DAYS
+    liquid, avgv, vnote, v7, excluded = set(), {}, {}, {}, []
     for k in set(vols) | {t for t in state if inuni(t)}:
         vs = vols.get(k, [])
         if len(vs) >= MIN_VOL_DAYS: a = float(np.mean(vs[-VOL_DAYS:])); note = ''
         elif k in state and state[k].get('median_volume'): a = float(state[k]['median_volume']); note = 'الحجم من الحالة (daily-data أقل من 20 يوماً)'
         else: a = float(np.mean(vs)) if vs else 0.0; note = f'الحجم من {len(vs)} يوماً فقط'
-        if a >= MIN_AVG_VOL: liquid.add(k); avgv[k] = a; vnote[k] = note
+        if a < MIN_AVG_VOL: continue
+        v7k = [vbd.get(k, {}).get(d, 0.0) for d in last7]; over = sum(1 for v in v7k if v >= MIN_AVG_VOL)
+        tail = vs[-VOL_DAYS:]; share = (max(tail) / sum(tail)) if tail else 0.0
+        med7 = float(np.median(v7k)) if v7k else 0.0
+        if can7 and over < MIN_DAYS_OVER:
+            px = state[k]['last_close'] if k in state else (closes_recent.get(k, [(None, None)])[-1][1])
+            why = f'متوسط 60 يوماً {a:,.0f} لكن الحجم ≥ 1M في {over} من 7 أيام فقط' + (f' — يوم واحد يشكل {share:.0%} من الإجمالي (طفرة/تجميع)' if share >= SPIKE_SHARE else '')
+            excluded.append({'الرمز': k, 'السعر': round(px, 4 if (px and px < 1) else 2) if px else None, 'متوسط_حجم_60_يوم': int(a),
+                             'أيام_فوق_مليون_من_7': over, 'وسيط_حجم_7_ايام': int(med7), 'نسبة_اكبر_يوم_من_60': round(share, 3), 'السبب': why})
+            continue
+        if not can7: note = (note + ' | ' if note else '') + f'فحص 7 أيام غير ممكن (ملفات daily-data = {len(last7)})'
+        elif share >= SPIKE_SHARE: note = (note + ' | ' if note else '') + f'⚠️ يوم واحد يشكل {share:.0%} من حجم 60 يوماً'
+        liquid.add(k); avgv[k] = a; vnote[k] = note; v7[k] = (over if can7 else None, int(med7) if can7 else None)
+    globals()['LIQUID_SET'] = set(liquid) if can7 else None      # بلا 7 ملفات لا يُفرَض الفلتر على المحركات القديمة
     # --- مرور 2: الملفات الأقدم للسائلة فقط (لإعادة حساب RSI المستقل)
     older = {k: [] for k in liquid}
     for f in older_files:
@@ -97,7 +119,7 @@ def run(state, universe, last_date, daily_dir):
                 c = _num(r.get('close'))
                 if c and c > 0: older[k].append((date, c))
     missing = _missing_days(dates)
-    INFO.clear(); INFO.update(missing_days=missing, files=len(dates), liquid=len(liquid))
+    INFO.clear(); INFO.update(missing_days=missing, files=len(dates), liquid=len(liquid), excluded=len(excluded))
     rank = {'مؤكد (المصدران)': 0, 'مصدر واحد (التحقق غير ممكن)': 1, 'دقّق: مصدر واحد فقط يحقق الشرط': 2}
     rows_all, rows_alert = [], []
     for t in liquid:
@@ -136,7 +158,8 @@ def run(state, universe, last_date, daily_dir):
                 'القاع_الاحمر': round(s['hist_low_rsi'], 2) if (mature and s.get('hist_low_rsi') is not None) else None,
                 'الاصفر_الادنى': round(yl, 2), 'الاصفر_الاعلى': round(yh, 2),
                 'المسافة_من_الاصفر_الادنى': round(x - yl, 2) if x is not None else None,
-                'متوسط_حجم_60_يوم': int(avgv[t]), 'RSI_تحقق': round(xi, 2) if ind_ok else None, 'فرق_التحقق': diff,
+                'متوسط_حجم_60_يوم': int(avgv[t]), 'أيام_فوق_مليون_من_7': v7[t][0], 'وسيط_حجم_7_ايام': v7[t][1],
+                'RSI_تحقق': round(xi, 2) if ind_ok else None, 'فرق_التحقق': diff,
                 'حالة_المصدرين': agree, 'آخر_يوم_تداول': last_td, 'ملاحظة': ' | '.join(notes)}
         rows_all.append(base)
         if hit:
@@ -147,13 +170,16 @@ def run(state, universe, last_date, daily_dir):
     df_al = pd.DataFrame(rows_alert)
     if len(df_al): df_al = df_al.sort_values(['_r', 'المسافة_من_الاصفر_الادنى', 'الرمز']).drop(columns='_r').reset_index(drop=True)
     else: df_al = pd.DataFrame(columns=COLS_ALERT)
-    return df_all, df_al[COLS_ALERT]
+    df_ex = pd.DataFrame(excluded, columns=COLS_EXCL)
+    if len(df_ex): df_ex = df_ex.sort_values('متوسط_حجم_60_يوم', ascending=False).reset_index(drop=True)
+    return df_all, df_al[COLS_ALERT], df_ex
 
-def write_xlsx(path, df_all, df_alert):
-    """ملف واحد بورقتين (القسم 1: كل الأسهم السائلة، القسم 2: من يحقق الشرط)."""
+def write_xlsx(path, df_all, df_alert, df_excl=None):
+    """ملف واحد: القسم 1 كل الأسهم السائلة، القسم 2 من يحقق الشرط، القسم 3 (إعلامي) المستبعدة بسبب طفرة يوم واحد."""
     from openpyxl import Workbook
     from rsi_report import _sheet
     wb = Workbook(); wb.remove(wb.active)
     w = {'نوع_التنبيه': 30, 'درجة_التأكيد': 30, 'حالة_المصدرين': 26, 'ملاحظة': 44, 'آخر_يوم_تداول': 16, 'المسافة_من_الاصفر_الادنى': 18}
     _sheet(wb, SHEET_ALL, df_all, w); _sheet(wb, SHEET_ALERT, df_alert, w)
+    if df_excl is not None: _sheet(wb, SHEET_EXCL, df_excl, dict(w, السبب=90))
     wb.save(path)
